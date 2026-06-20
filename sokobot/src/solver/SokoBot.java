@@ -1,5 +1,8 @@
 package solver;
 
+import java.util.LinkedList; // used for: BFS in distance table computation
+import java.util.Queue; // used for: BFS in distance table computation
+
 public class SokoBot {
 
     /** Maximum width of puzzle grid. */
@@ -26,8 +29,8 @@ public class SokoBot {
     */
     private boolean[][] deadSquares;
 
-    /** 3D Distance Matrix for Min-Push Heuristic calculation.  */
-    // private int[][][] distanceTable;
+    /** 2D Distance Matrix for Min-Push Heuristic calculation.  */
+    private int[][] distanceTable;
 
 
   public String solveSokobanPuzzle(int width, int height, char[][] mapData, char[][] itemsData) {
@@ -79,7 +82,7 @@ public class SokoBot {
             }
       }
 
-      computeDeadSquares(); //based on the extracted walls and goals, compute the dead squares of the puzzle.
+      computeDeadSquares(); //based on the extracted walls and goals, compute the dead squares of the puzzle to avoid.
       computeBoxGoalDistances(); //based on the extracted walls and goals, compute the distance table for the min-push heuristic.
 
   }
@@ -90,20 +93,18 @@ public class SokoBot {
 
     //Case 1: Dead Corner Detection (mark every corner that is a non-goal square as a dead square, since any box pushed into that cell can never be moved into a goal.)
     for (int r = 0; r < height; r++) {
-        for (int c = 0; c < width; c++) {
-            
+        for (int c = 0; c < width; c++) {       
             // Exclude coordinates holding blocking structures or valid goals
             if (walls[r][c] || goals[r][c]) {
                 continue;
             }
             
-            // Checking of adjacent cells and determining whether the current cell is a corner (has 2 adjacent walls that are perpendicular to each other)
             boolean wallNorth = (r - 1 >= 0) && walls[r - 1][c];
             boolean wallSouth = (r + 1 < height) && walls[r + 1][c];
             boolean wallWest  = (c - 1 >= 0) && walls[r][c - 1];
             boolean wallEast  = (c + 1 < width) && walls[r][c + 1];
             
-            // Mark the tile as a dead square if it is a corner (has 2 adjacent walls that are perpendicular to each other)
+            // Mark the tile as a dead square if it is a corner 
             if ((wallNorth && wallEast) || 
                 (wallEast && wallSouth) || 
                 (wallSouth && wallWest) || 
@@ -114,14 +115,110 @@ public class SokoBot {
         }
     }
 
+    //Case 2: Dead Square Detection (mark every non-goal square that is in a dead-square corridor, except for corridors that have goals)
+    for (int r = 0; r < height; r++){
+      for (int c = 0; c < width; c++) {
+
+        if (!deadSquares[r][c] || goals[r][c]) { //start dead corridor detection only if it's a dead corner or a non-goal
+            continue; 
+        }
+
+        int column = c+1; // scan to the right
+        boolean goalDetected = false; 
+
+        while (column < width && !walls[r][column]) { // traverse until a wall is reached 
+          if (goals[r][column]){
+            goalDetected = true;
+            break; // if goal has been detected, do not mark the corridor as a dead corridor
+          }
+
+          if (deadSquares[r][column]) { 
+            boolean wallNorth = true;
+            boolean wallSouth = true;
+
+            for (int check = c; check <= column; check++) { //corridor is only valid if atleast one side of the corridor is a continuous wall (for it to be completely dead)
+                // check if wall above is broken 
+                if (r - 1 < 0 || !walls[r - 1][check]) {
+                    wallNorth = false;
+                }
+                // check if wall below is broken
+                if (r + 1 >= height || !walls[r + 1][check]) {
+                    wallSouth = false;
+                }
+            }
+
+            if (!goalDetected && (wallNorth || wallSouth)) {
+                for (int dead = c; dead <= column; dead++) { 
+                    deadSquares[r][dead] = true; 
+                }
+            }
+            break; 
+        }     
+        column++;
+      }
+    }
+
   }
+
+}    
 
   private void computeBoxGoalDistances() {
+    
+    this.distanceTable = new int[height][width]; //setup distance table, assume every tile is unreachable
+    
+    for (int r = 0; r < height; r++) {
+        for (int c = 0; c < width; c++) {
+            this.distanceTable[r][c] = Integer.MAX_VALUE; 
+        }
+    }
 
+    Queue<int[]> queue = new LinkedList<>();
+
+    for (int r = 0; r < height; r++) {
+        for (int c = 0; c < width; c++) {
+            if (goals[r][c]) {
+                this.distanceTable[r][c] = 0; //locate all goals and set distance value to 0  
+                queue.add(new int[]{r, c});} //then, load to queue
+          }
+      }
+
+    int[] dRow = {-1, 1, 0, 0};
+    int[] dCol = {0, 0, -1, 1};
+
+      while (!queue.isEmpty()) { //will loop until every tile has been evaluated 
+        int[] current = queue.poll();
+        int currRow = current[0];
+        int currCol = current[1];
+        int currentDist = this.distanceTable[currRow][currCol];
+
+          for (int i = 0; i < 4; i++) { // check the current cell's neighboring tiles (using direction vectors)
+              
+              int nextRow = currRow + dRow[i];
+              int nextCol = currCol + dCol[i];
+
+              if (nextRow >= 0 && nextRow < height && nextCol >= 0 && nextCol < width) {
+                  if (walls[nextRow][nextCol]) { //skip if neighboring tile is a wall
+                      continue;
+                  }
+
+                  if (currentDist + 1 < this.distanceTable[nextRow][nextCol]) { //if shorter path is found, update distance table and push neighbor to the queue
+                      this.distanceTable[nextRow][nextCol] = currentDist + 1;
+                      queue.add(new int[]{nextRow, nextCol});
+                  }
+              }
+          }
+      }
+    }
+  
+  
+  
+
+
+
+
+
+
+
+  
+  
   }
-
-
-
-
-
-}
