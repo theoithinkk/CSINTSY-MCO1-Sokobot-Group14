@@ -1,9 +1,15 @@
 package solver;
 
-import java.util.LinkedList; // used for: BFS in distance table computation
-import java.util.Queue; // used for: BFS in distance table computation
-import java.util.List;        // used for: passing box positions around
-import java.util.Arrays;      // used for: sorting + hashing the box arrays in State
+import java.util.ArrayDeque; // used for: BFS in distance table computation
+import java.util.ArrayList; // used for: BFS in distance table computation
+import java.util.Arrays;        // used for: passing box positions around
+import java.util.Comparator;   // used for: building successor box configurations
+import java.util.HashMap;      // used for: sorting + hashing the box arrays in State
+import java.util.HashSet; // used for: the A* open list
+import java.util.LinkedList;    // used for: ordering nodes in the open list by lexicographic cost
+import java.util.List;       // used for: best-known-cost bookkeeping (open list dedup)
+import java.util.PriorityQueue;       // used for: the A* closed list
+import java.util.Queue;    // used for: reconstructing the move string in buildPath()
 
 public class SokoBot {
 
@@ -44,21 +50,107 @@ public class SokoBot {
     private int[][] distanceTable;
 
 
+    /**
+     * Drives the whole solve: parses the puzzle's dynamic items, then runs A* search over
+     * the push-based state space (see {@link #expand} and PART 4 below) until a solved
+     * configuration is found or the time/node budget runs out.
+     * <p>
+     * Two cost components are tracked per search node, compared lexicographically:
+     * pushes first (the conventional Sokoban notion of an optimal solution, and the one the
+     * heuristic in PART 3 actually bounds), then total real keypresses as a tie-break so that,
+     * among multiple routes that all use the minimum number of pushes, the one needing the
+     * least walking in between is preferred. See {@link Node} and {@link #expand} for exactly
+     * how this is enforced.
+     *
+     * @param width     width of the puzzle grid
+     * @param height    height of the puzzle grid
+     * @param mapData   static layout ({@code '#'} walls, {@code '.'} goals)
+     * @param itemsData dynamic layout ({@code '@'} player, {@code '$'} boxes)
+     * @return a string of {@code u}/{@code d}/{@code l}/{@code r} moves that solves the puzzle,
+     *         or {@code ""} if no solution could be found within the time/node budget
+     */
     public String solveSokobanPuzzle(int width, int height, char[][] mapData, char[][] itemsData) {
-        /*
-         * YOU NEED TO REWRITE THE IMPLEMENTATION OF THIS METHOD TO MAKE THE BOT SMARTER
-         */
-        /*
-         * Default stupid behavior: Think (sleep) for 3 seconds, and then return a
-         * sequence
-         * that just moves left and right repeatedly.
-         */
-        try {
-            Thread.sleep(3000);
-        } catch (Exception ex) {
-            ex.printStackTrace();
+
+        // Self-imposed budget, comfortably under the harness's hard 15s cutoff. Checked
+        // periodically inside the search loop so a pathological level can't hang forever.
+        long deadline = System.nanoTime() + 14_000_000_000L;
+
+        initialize(width, height, mapData, itemsData);
+
+        // --- parse the dynamic items: the player's start cell and every box ---
+        List<int[]> boxes = new ArrayList<>();
+        int startPlayerR = -1;
+        int startPlayerC = -1;
+
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                char itemTile = itemsData[r][c];
+                if (itemTile == '$') {
+                    boxes.add(new int[]{r, c});
+                } else if (itemTile == '@') {
+                    startPlayerR = r;
+                    startPlayerC = c;
+                }
+            }
         }
-        return "lrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlrlr";
+
+        if (isDeadlocked(boxes)) {
+            return ""; // already unsolvable from the start position, no point searching at all
+        }
+
+        // --- A* bookkeeping ---
+        // Lexicographic ordering: primary key is f = g + h (pushes), so the search remains
+        // provably push-optimal. Only once two nodes are TIED on f (and on h -- for a goal node
+        // h is always 0, so any two push-tied solutions are tied here too) does totalMoves break
+        // the tie, so the cheaper-to-walk route among equally-pushed solutions wins, rather than
+        // whichever one happens to come off Java's heap first.
+        int[] canonicalStart = canonicalPlayer(boxes, startPlayerR, startPlayerC);
+        State startState = new State(boxes, canonicalStart[0], canonicalStart[1]);
+
+        PriorityQueue<Node> open = new PriorityQueue<>(
+                Comparator.<Node>comparingInt(n -> n.g + n.h)
+                        .thenComparingInt(n -> n.h)
+                        .thenComparingInt(n -> n.totalMoves)
+        );
+        // bestCost tracks the lexicographic (pushes, totalMoves) pair per state, packed into a
+        // single long so two states can be compared with one numeric comparison. totalMoves is
+        // bounded well under 1,000,000 by the time/node budget below, so this packing is safe.
+        HashMap<State, Long> bestCost = new HashMap<>();
+        HashSet<State> closed = new HashSet<>();
+
+        Node startNode = new Node(startState, startPlayerR, startPlayerC, 0, 0, heuristic(boxes), null, "");
+        open.add(startNode);
+        bestCost.put(startState, packCost(0, 0));
+
+        // Hard safety valve on memory/time independent of the wall-clock check, in case a
+        // level's reachable state space is enormous (mainly a concern for dense 8-box levels).
+        final int MAX_NODES = 400_000;
+        int nodesExpanded = 0;
+
+        while (!open.isEmpty()) {
+
+            if (nodesExpanded > MAX_NODES || System.nanoTime() > deadline) {
+                return ""; // out of budget; let the harness report "took too long" instead of returning a guess
+            }
+
+            Node current = open.poll();
+
+            if (closed.contains(current.state)) {
+                continue; // stale duplicate left behind by lazy deletion from the open list
+            }
+            closed.add(current.state);
+            nodesExpanded++;
+
+            List<int[]> currentBoxes = stateToBoxList(current.state);
+
+            if (isSolved(currentBoxes)) {
+                return buildPath(current);
+            }
+
+            expand(current, currentBoxes, open, bestCost, closed);
+        }
+
+        return ""; // open list exhausted with no goal found: this level is unsolvable
     }
 
     /**
@@ -907,5 +999,223 @@ public class SokoBot {
             }
         }
         return true;
+    }
+
+    /**
+     * ===========================================================================================
+     * PART 4: A* SEARCH ENGINE AND SOLUTION RECONSTRUCTION
+     * - Node (class): one A* search node -- a State plus its g/h/totalMoves/parent/move-string
+     *   bookkeeping, compared lexicographically (pushes first, then total moves) by the open list
+     * - stateToBoxList(): unpacks a State's sorted int[][] back into a List<int[]> for reuse
+     *   with the Part 1-3 helpers that expect that shape
+     * - expand(): state expansion + push generation -- the successor function for A*, tries
+     *   pushing every box in every direction and enqueues the legal, non-deadlocked results
+     * - buildPath(): solution reconstruction -- walks parent pointers back to the root and
+     *   re-emits each edge's moves in forward order
+     * - packCost(): packs a (pushes, totalMoves) pair into one long for cheap lexicographic
+     *   comparison in the open-list dedup map
+     * ============================================================================================
+     */
+
+    /**
+     * One node in the A* search tree.
+     * <p>
+     * {@code state} carries the box layout plus the player's <em>canonical</em> reachable-region
+     * cell, used purely for hashing/deduplication (see {@link State}). {@code trueR}/{@code trueC}
+     * carry the player's actual physical position at this node -- i.e. the cell the previously
+     * pushed box used to occupy, or the puzzle's literal starting cell for the root node.
+     * <p>
+     * Keeping these separate matters: two states with the same boxes and the same reachable
+     * region are the same search state regardless of exactly where in that region the player
+     * is standing (they can walk anywhere in it for free), so canonicalization is correct and
+     * necessary to keep the state space from exploding. But the canonical cell is just an
+     * arbitrary representative of the region (the top-left-most free cell) -- it is generally
+     * NOT where the player is actually standing. Reconstructing a real, physically walkable
+     * move string requires walking from the actual previous position, so {@link #expand} must
+     * use {@code trueR}/{@code trueC} (never the canonical cell) as the BFS source when it
+     * calls {@link #pathTo(List, int, int, int, int)}.
+     * <p>
+     * {@code g} and {@code totalMoves} together form the lexicographic search cost: {@code g}
+     * (pushes) is the primary criterion the heuristic actually bounds, while {@code totalMoves}
+     * (every real keypress, walking included) is a secondary tie-break so that among multiple
+     * push-count-tied routes to the same goal, the one needing less walking is preferred.
+     */
+    private static class Node {
+        final State state;
+        final int trueR;
+        final int trueC;
+        final int g; // pushes made so far
+        final int totalMoves; // real keypresses so far (pushes + all walking steps)
+        final int h; // admissible lower bound on pushes remaining
+        final Node parent;
+        final String moves; // walk + push letters taken from parent to reach this node
+
+        Node(State state, int trueR, int trueC, int g, int totalMoves, int h, Node parent, String moves) {
+            this.state = state;
+            this.trueR = trueR;
+            this.trueC = trueC;
+            this.g = g;
+            this.totalMoves = totalMoves;
+            this.h = h;
+            this.parent = parent;
+            this.moves = moves;
+        }
+    }
+
+    /**
+     * Unpacks a {@link State}'s sorted {@code int[][]} box array back into a {@code List<int[]>},
+     * the shape every Part 1-3 helper ({@link #heuristic}, {@link #isDeadlocked}, {@link #occupied},
+     * etc.) expects.
+     *
+     * @param state the state to unpack
+     * @return the same box positions as a list, in whatever order {@link State} sorted them in
+     */
+    private List<int[]> stateToBoxList(State state) {
+        List<int[]> list = new ArrayList<>(state.boxes.length);
+        for (int[] box : state.boxes) {
+            list.add(new int[]{box[0], box[1]});
+        }
+        return list;
+    }
+
+    /**
+     * State expansion: generates every legal successor of {@code current} by trying to push
+     * each box one step in each of the four directions, and enqueues the survivors onto the
+     * open list.
+     * <p>
+     * A push of box {@code (br, bc)} in direction {@code (dRow, dCol)} requires:
+     * <ol>
+     *   <li>the player can actually reach the cell behind the box, {@code (br - dRow, bc - dCol)},
+     *       without pushing anything else first -- checked against the box's current reachable
+     *       region ({@link #findReachable});</li>
+     *   <li>the destination cell, {@code (br + dRow, bc + dCol)}, is in bounds, not a wall, not
+     *       a known dead square, and not already occupied by another box;</li>
+     *   <li>the resulting box configuration is not an immediate deadlock -- checked last since
+     *       it's the most expensive test ({@link #isDeadlocked}).</li>
+     * </ol>
+     * Successors that pass all three are only enqueued if they reach their resulting state at a
+     * strictly better (pushes, totalMoves) lexicographic cost than any previously recorded route
+     * to that same state (or are reaching it for the first time) -- this is the standard "lazy
+     * deletion" pattern for using a {@link PriorityQueue} (which has no decrease-key) as an A*
+     * open list, extended to a lexicographic cost so that among multiple routes tied on push
+     * count, the one needing less walking wins.
+     *
+     * @param current   the node being expanded
+     * @param boxes     {@code current}'s box positions, already unpacked via {@link #stateToBoxList}
+     * @param open      the A* open list
+     * @param bestCost  best known (pushes, totalMoves) lexicographic cost seen so far for each
+     *                  visited state, packed via {@link #packCost}
+     * @param closed    states that have already been popped and fully expanded
+     */
+    private void expand(Node current, List<int[]> boxes, PriorityQueue<Node> open,
+                         HashMap<State, Long> bestCost, HashSet<State> closed) {
+
+        Reach reach = findReachable(boxes, current.trueR, current.trueC);
+
+        int[] dRow = {-1, 1, 0, 0};
+        int[] dCol = {0, 0, -1, 1};
+        char[] dirChar = {'u', 'd', 'l', 'r'};
+
+        for (int boxIndex = 0; boxIndex < boxes.size(); boxIndex++) {
+            int[] box = boxes.get(boxIndex);
+            int br = box[0];
+            int bc = box[1];
+
+            for (int dir = 0; dir < 4; dir++) {
+                int standR = br - dRow[dir]; // where the player must stand to push this box this way
+                int standC = bc - dCol[dir];
+                int destR = br + dRow[dir];  // where the box would land
+                int destC = bc + dCol[dir];
+
+                if (standR < 0 || standR >= height || standC < 0 || standC >= width) {
+                    continue;
+                }
+                if (!reach.reachable[standR][standC]) {
+                    continue; // player can't get behind the box to push it this way
+                }
+
+                if (destR < 0 || destR >= height || destC < 0 || destC >= width) {
+                    continue;
+                }
+                if (walls[destR][destC] || deadSquares[destR][destC]) {
+                    continue; // illegal landing spot, or provably unsolvable from there
+                }
+                if (occupied(boxes, destR, destC)) {
+                    continue; // another box is already sitting there
+                }
+
+                // build the successor box configuration: every box stays put except this one
+                List<int[]> newBoxes = new ArrayList<>(boxes.size());
+                for (int[] b : boxes) {
+                    newBoxes.add(b);
+                }
+                newBoxes.set(boxIndex, new int[]{destR, destC});
+
+                if (isDeadlocked(newBoxes)) {
+                    continue; // frozen-box / Hall's-theorem prune
+                }
+
+                // the player physically ends up where the box used to be
+                int[] canonical = canonicalPlayer(newBoxes, br, bc);
+                State newState = new State(newBoxes, canonical[0], canonical[1]);
+
+                if (closed.contains(newState)) {
+                    continue;
+                }
+
+                // walk from the TRUE current position (not the canonical one) to behind the box
+                String walk = pathTo(boxes, current.trueR, current.trueC, standR, standC);
+                String moves = walk + dirChar[dir];
+
+                int g2 = current.g + 1; // one push
+                int totalMoves2 = current.totalMoves + moves.length(); // walk steps + this push
+
+                long newCost = packCost(g2, totalMoves2);
+                Long prevBest = bestCost.get(newState);
+                if (prevBest != null && prevBest <= newCost) {
+                    continue; // already reached this configuration at least as cheaply
+                }
+                bestCost.put(newState, newCost);
+
+                int h2 = heuristic(newBoxes);
+                open.add(new Node(newState, br, bc, g2, totalMoves2, h2, current, moves));
+            }
+        }
+    }
+
+    /**
+     * Solution reconstruction: walks the parent chain from the goal node back to the root,
+     * collecting each edge's move string, then re-emits them in forward (root-to-goal) order.
+     *
+     * @param goalNode the node whose box configuration satisfies {@link #isSolved}
+     * @return the full move string -- every {@code u}/{@code d}/{@code l}/{@code r} from the
+     *         puzzle's start to the solved configuration, in order
+     */
+    private String buildPath(Node goalNode) {
+        ArrayDeque<String> segments = new ArrayDeque<>();
+        Node cur = goalNode;
+        while (cur.parent != null) {
+            segments.addFirst(cur.moves);
+            cur = cur.parent;
+        }
+
+        StringBuilder solution = new StringBuilder();
+        for (String segment : segments) {
+            solution.append(segment);
+        }
+        return solution.toString();
+    }
+
+    /**
+     * Packs a (pushes, totalMoves) pair into a single {@code long} so two lexicographic costs
+     * can be compared with one numeric comparison. Safe as long as {@code totalMoves} stays
+     * under 1,000,000, which the time/node budget in {@link #solveSokobanPuzzle} guarantees.
+     *
+     * @param pushes     number of pushes in this cost
+     * @param totalMoves number of real keypresses (pushes + walking) in this cost
+     * @return a single comparable long encoding both, pushes as the more significant component
+     */
+    private static long packCost(int pushes, int totalMoves) {
+        return (long) pushes * 1_000_000L + totalMoves;
     }
 }
