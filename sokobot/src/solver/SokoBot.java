@@ -162,6 +162,21 @@ public class SokoBot {
      * ============================================================================================
      */
 
+    /**
+     * Initializes the puzzle board representation of the Sokoban puzzle
+     * 
+     * <p> This method parses the map data to classify which tiles of the puzzle 
+     * are walls or goals before storing them in their dedicated 2D matrices. Once the
+     * basic board information is extracted, the preprocessing methods computeDeadSquares() 
+     * and computeBoxGoalDistances() are called, both of which implemented to help the solver 
+     * further on in the program as it searches for a solution to the puzzle. </p>
+     * 
+     * @param width the width of the puzzle board
+     * @param height the height of the puzzle board
+     * @param mapData the board layout containing walls and goals of the current Sokoban puzzle 
+     * @param itemsData the board layout containing the player and the boxes of the current Sokoban puzzle
+     */
+
     private void initialize(int width, int height, char[][] mapData, char[][] itemsData) {
 
         this.width = width;
@@ -192,81 +207,152 @@ public class SokoBot {
 
     }
 
+    /**
+     * Classifies which tiles are dead squares on the Sokoban board and marks them through a 2D matrix
+     * 
+     * <p> A dead square is any non-goal tile in the board which can make the puzzle unsolvable
+     * once a box is pushed onto that position. Marking the dead squares of the puzzle during
+     * the preprocessing stage allows the solver to avoid moves that would inevitably lead to an unsolvable state. </p>
+     * 
+     * <p> Two cases of dead squares are detected in this method. First, it loops through the board
+     * to mark dead corners, which are all non-goal tiles that are adjacent to walls on two
+     * perpendicular sides. Second, it scans the board again to identify dead corridors which are sequences
+     * of non-goal tiles between two dead corners that lie along a continuous wall and contain no goal tiles. </p>
+     * 
+     * <p> The dead-square statuses of the tiles are stored in the {@code deadSquares} matrix, where tiles marked 
+     * {@code true} indicates that the solver should avoid that tile while searching for a path. </p>
+     */
     private void computeDeadSquares() {
 
-        this.deadSquares = new boolean[height][width];
+      this.deadSquares = new boolean[height][width];
 
-        //Case 1: Dead Corner Detection (mark every corner that is a non-goal square as a dead square, since any box pushed into that cell can never be moved into a goal.)
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                // Exclude coordinates holding blocking structures or valid goals
-                if (walls[r][c] || goals[r][c]) {
-                    continue;
-                }
+      //Case 1: Dead Corner Detection (mark every corner that is a non-goal square as a dead square, since any box pushed into that cell can never be moved into a goal.)
+      for (int r = 0; r < height; r++) {
+          for (int c = 0; c < width; c++) {
+              // Exclude coordinates holding blocking structures or valid goals
+              if (walls[r][c] || goals[r][c]) {
+                  continue;
+              }
 
-                boolean wallNorth = (r - 1 >= 0) && walls[r - 1][c];
-                boolean wallSouth = (r + 1 < height) && walls[r + 1][c];
-                boolean wallWest = (c - 1 >= 0) && walls[r][c - 1];
-                boolean wallEast = (c + 1 < width) && walls[r][c + 1];
+              boolean wallNorth = (r - 1 >= 0) && walls[r - 1][c];
+              boolean wallSouth = (r + 1 < height) && walls[r + 1][c];
+              boolean wallWest = (c - 1 >= 0) && walls[r][c - 1];
+              boolean wallEast = (c + 1 < width) && walls[r][c + 1];
 
-                // Mark the tile as a dead square if it is a corner
-                if ((wallNorth && wallEast) ||
-                        (wallEast && wallSouth) ||
-                        (wallSouth && wallWest) ||
-                        (wallWest && wallNorth)) {
+              // Mark the tile as a dead square if it is a corner
+              if ((wallNorth && wallEast) ||
+                      (wallEast && wallSouth) ||
+                      (wallSouth && wallWest) ||
+                      (wallWest && wallNorth)) {
 
-                    this.deadSquares[r][c] = true;
-                }
+                  this.deadSquares[r][c] = true;
+              }
+          }
+      }
+
+      //Case 2: Dead Square Detection (mark every non-goal square that is in a dead-square corridor, except for corridors that have goals)
+      for (int r = 0; r < height; r++) { 
+          for (int c = 0; c < width; c++) {
+
+              if (!deadSquares[r][c] || goals[r][c]) { //start only if it is already marked as a dead square and is not a goal
+                  continue;
+              }
+
+              int column = c + 1; // scan to the right
+              boolean goalDetected = false;
+
+              while (column < width && !walls[r][column]) { // traverse until a wall is reached
+                  if (goals[r][column]) {
+                      goalDetected = true;
+                      break; // if goal has been detected, do not mark the corridor as a dead corridor
+                  }
+
+                  if (deadSquares[r][column]) {
+                      boolean wallNorth = true;
+                      boolean wallSouth = true;
+
+                      for (int check = c; check <= column; check++) { //corridor is only valid if atleast one side of the corridor is a continuous wall (for it to be completely dead)
+                          // check if wall above is broken
+                          if (r - 1 < 0 || !walls[r - 1][check]) {
+                              wallNorth = false;
+                          }
+                          // check if wall below is broken
+                          if (r + 1 >= height || !walls[r + 1][check]) {
+                              wallSouth = false;
+                          }
+                      }
+
+                      if (!goalDetected && (wallNorth || wallSouth)) {
+                          for (int dead = c; dead <= column; dead++) {
+                              deadSquares[r][dead] = true;
+                          }
+                      }
+                      break;
+                  }
+                  column++;
+              }
+          }
+      }
+
+      for (int r = 0; r < height; r++) {
+          for (int c = 0; c < width; c++) {
+
+            if (!deadSquares[r][c] || goals[r][c]) { //start only if it is already marked as a dead square and is not a goal
+              continue;
             }
-        }
 
-        //Case 2: Dead Square Detection (mark every non-goal square that is in a dead-square corridor, except for corridors that have goals)
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
+            int row = r + 1;
+            boolean goalDetected = false;
 
-                if (!deadSquares[r][c] || goals[r][c]) { //start dead corridor detection only if it's a dead corner or a non-goal
-                    continue;
+            while (row < height && !walls[row][c]) {
+
+                if (goals[row][c]) {
+                    goalDetected = true;
+                    break;
                 }
 
-                int column = c + 1; // scan to the right
-                boolean goalDetected = false;
+                if (deadSquares[row][c]) {
+                    boolean wallWest = true;
+                    boolean wallEast = true;
 
-                while (column < width && !walls[r][column]) { // traverse until a wall is reached
-                    if (goals[r][column]) {
-                        goalDetected = true;
-                        break; // if goal has been detected, do not mark the corridor as a dead corridor
+                    for (int check = r; check <= row; check++) {
+                      // Check if left wall is continuous
+                      if (c - 1 < 0 || !walls[check][c - 1]) {
+                          wallWest = false;
+                      }
+                      // Check if right wall is continuous
+                      if (c + 1 >= width || !walls[check][c + 1]) {
+                          wallEast = false;
+                      }
                     }
 
-                    if (deadSquares[r][column]) {
-                        boolean wallNorth = true;
-                        boolean wallSouth = true;
-
-                        for (int check = c; check <= column; check++) { //corridor is only valid if atleast one side of the corridor is a continuous wall (for it to be completely dead)
-                            // check if wall above is broken
-                            if (r - 1 < 0 || !walls[r - 1][check]) {
-                                wallNorth = false;
-                            }
-                            // check if wall below is broken
-                            if (r + 1 >= height || !walls[r + 1][check]) {
-                                wallSouth = false;
-                            }
+                    if (!goalDetected && (wallWest || wallEast)) {
+                        for (int dead = r; dead <= row; dead++) {
+                            deadSquares[dead][c] = true;
                         }
-
-                        if (!goalDetected && (wallNorth || wallSouth)) {
-                            for (int dead = c; dead <= column; dead++) {
-                                deadSquares[r][dead] = true;
-                            }
-                        }
-                        break;
                     }
-                    column++;
+                    break;
                 }
-            }
-
-        }
-
+                row++;
+              }
+          }
+      }
     }
 
+    /**
+     * Computes the distance from every reachable tile on the board to the nearest 
+     * goal tile
+     * 
+     * <p> The second method of the preprocessing phase performs a BFS starting from all goal
+     * locations simulataneously. Each goal is assigned to a distance value of {@code 0}, and neighboring
+     * tiles are explored in order of increasing distance.</p> 
+     * 
+     * <p> The resulting distances are stored in the 2D matrix {@code distanceTable}. For every
+     * reachable tile, the recorded value represents the length of the shortest path found to a 
+     * nearest goal tile. Tiles that cannot reach any goal remain assigned {@code Integer.MAX_VALUE}.
+     * The resulting distance table of this method will be later used by the solver to determine 
+     * which boxes are positioned closer to goal tiles.</p>
+     */
     private void computeBoxGoalDistances() {
 
         this.distanceTable = new int[height][width]; //setup distance table, assume every tile is unreachable
