@@ -133,9 +133,7 @@ public class SokoBot {
         while (!open.isEmpty()) {
 
             if (nodesExpanded > MAX_NODES || System.nanoTime() > deadline) {
-                System.out.println("Nodes expanded: " + nodesExpanded);
-                System.out.println("Time elapsed ms: " + (System.nanoTime() - (deadline - 14_000_000_000L)) / 1_000_000);
-                return "";
+                return ""; // out of budget; let the harness report "took too long" instead of returning a guess
             }
 
             Node current = open.poll();
@@ -649,13 +647,6 @@ public class SokoBot {
      */
 
     // ------------------------------------------------------------------
-    // FIELDS — add these to the class alongside walls, goals, deadSquares
-    // ------------------------------------------------------------------
-    // private int[][][] pushDist;   // [numGoals][height][width]
-    // private int[][]   goalPos;    // goalPos[i] = {row, col}
-    // private int       numGoals;
-
-    // ------------------------------------------------------------------
     // PREPROCESSING — call this from initialize() after walls/goals ready
     // ------------------------------------------------------------------
 
@@ -727,24 +718,14 @@ public class SokoBot {
      *         from this configuration
      */
     private int heuristic(List<int[]> boxes) {
-        int base = assignmentLowerBound(boxes);
-
-        // Count boxes not yet on goals that are still on the left side of the map
-        // (haven't passed through the bottleneck yet). Each one that needs to queue
-        // behind another adds implicit extra pushes the Hungarian matching misses.
-        int pendingLeft = 0;
-        int pendingRight = 0;
-        for (int[] box : boxes) {
-            if (goals[box[0]][box[1]]) continue; // already placed, ignore
-            if (box[1] < width / 2) pendingLeft++;
-            else pendingRight++;
-        }
-
-        // If multiple boxes are queued on the same side they will block each other:
-        // conservatively add (n-1) extra pushes per side for the waiting cost
-        int penalty = Math.max(0, pendingLeft - 1) + Math.max(0, pendingRight - 1);
-
-        return base + penalty;
+        // NOTE: a previous revision added a hardcoded left/right "bottleneck" penalty here.
+        // Removed: it assumed every level has a single congestion point at width/2, which is
+        // not generally true, and an inflated h(n) breaks A*'s admissibility guarantee --
+        // meaning the search is no longer provably push-optimal, and combined with the
+        // bestCost/closed-set pruning below, can permanently prune the true optimal path.
+        // The pushDist precomputation already removes the per-node BFS cost that this penalty
+        // was almost certainly compensating for; rely on that instead of an unsound heuristic.
+        return assignmentLowerBound(boxes);
     }
 
     /**
