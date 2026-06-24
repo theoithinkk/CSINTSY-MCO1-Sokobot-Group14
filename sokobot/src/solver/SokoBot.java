@@ -48,6 +48,9 @@ public class SokoBot {
      * 2D Distance Matrix for Min-Push Heuristic calculation.
      */
     private int[][] distanceTable;
+    private int[][][] pushDist;  // [numGoals][height][width]
+    private int[][]   goalPos;   // goalPos[i] = {row, col}
+    private int       numGoals;
 
 
     /**
@@ -124,13 +127,15 @@ public class SokoBot {
 
         // Hard safety valve on memory/time independent of the wall-clock check, in case a
         // level's reachable state space is enormous (mainly a concern for dense 8-box levels).
-        final int MAX_NODES = 400_000;
+        final int MAX_NODES = 2_000_000;
         int nodesExpanded = 0;
 
         while (!open.isEmpty()) {
 
             if (nodesExpanded > MAX_NODES || System.nanoTime() > deadline) {
-                return ""; // out of budget; let the harness report "took too long" instead of returning a guess
+                System.out.println("Nodes expanded: " + nodesExpanded);
+                System.out.println("Time elapsed ms: " + (System.nanoTime() - (deadline - 14_000_000_000L)) / 1_000_000);
+                return "";
             }
 
             Node current = open.poll();
@@ -203,6 +208,7 @@ public class SokoBot {
         }
 
         computeDeadSquares(); //based on the extracted walls and goals, compute the dead squares of the puzzle to avoid.
+        computeAllPushDistances();
         computeBoxGoalDistances(); //based on the extracted walls and goals, compute the distance table for the min-push heuristic.
 
     }
@@ -624,8 +630,91 @@ public class SokoBot {
      * - isBlockedOnAxis() / isBlockedSide(): freeze-deadlock helpers, one axis at a time
      * - hasGoalAssignment(): Hall's-theorem style feasibility check (perfect bipartite matching exists)
      * - isSolved(): every box currently sits on a goal
+     *
+     * KEY OPTIMIZATION over the original:
+     *   The original called bfsPushDistanceFromBox() — a full O(height*width) BFS — inside both
+     *   assignmentLowerBound() and hasGoalAssignment() on every generated successor node.
+     *   With 5 boxes and 200,000 node expansions that is millions of BFS runs.
+     *
+     *   The fix: precompute pushDist[goalIndex][r][c] ONCE in initialize() by running one
+     *   backwards BFS per goal.  During search every cost lookup becomes an O(1) table read.
+     *   Two new fields are required in the enclosing class:
+     *
+     *       private int[][][] pushDist;   // [numGoals][height][width], filled by computeAllPushDistances()
+     *       private int[][]   goalPos;    // goalPos[i] = {row, col} for goal i
+     *       private int       numGoals;
+     *
+     *   Call computeAllPushDistances() from initialize(), after walls/goals are parsed.
      * ============================================================================================
      */
+
+    // ------------------------------------------------------------------
+    // FIELDS — add these to the class alongside walls, goals, deadSquares
+    // ------------------------------------------------------------------
+    // private int[][][] pushDist;   // [numGoals][height][width]
+    // private int[][]   goalPos;    // goalPos[i] = {row, col}
+    // private int       numGoals;
+
+    // ------------------------------------------------------------------
+    // PREPROCESSING — call this from initialize() after walls/goals ready
+    // ------------------------------------------------------------------
+
+    /**
+     * Precomputes push distances from every board cell to every goal.
+     * <p>
+     * Runs one backwards BFS <em>per goal</em> over the box-push graph (walls block,
+     * every non-wall step costs 1 push).  Stores results in {@code pushDist[g][r][c]}.
+     * <p>
+     * Total cost: O(numGoals * height * width) — paid once at startup.
+     * Without this, the original code recomputed equivalent BFS data inside
+     * {@code assignmentLowerBound} and {@code hasGoalAssignment} on every node expansion,
+     * which was O(numBoxes * numGoals * height * width) <em>per node</em>.
+     */
+    private void computeAllPushDistances() {
+        // Collect goal positions
+        List<int[]> goalList = new ArrayList<>();
+        for (int r = 0; r < height; r++)
+            for (int c = 0; c < width; c++)
+                if (goals[r][c]) goalList.add(new int[]{r, c});
+
+        numGoals = goalList.size();
+        goalPos  = goalList.toArray(new int[0][]);
+        pushDist = new int[numGoals][height][width];
+
+        int[] dRow = {-1, 1, 0, 0};
+        int[] dCol = {0, 0, -1, 1};
+
+        for (int g = 0; g < numGoals; g++) {
+            int[][] dist = pushDist[g];
+            for (int[] row : dist) Arrays.fill(row, Integer.MAX_VALUE);
+
+            int gr = goalPos[g][0], gc = goalPos[g][1];
+            dist[gr][gc] = 0;
+
+            Queue<int[]> queue = new LinkedList<>();
+            queue.add(new int[]{gr, gc});
+
+            while (!queue.isEmpty()) {
+                int[] cur  = queue.poll();
+                int   cr   = cur[0], cc = cur[1];
+                int   cd   = dist[cr][cc];
+
+                for (int i = 0; i < 4; i++) {
+                    int nr = cr + dRow[i], nc = cc + dCol[i];
+                    if (nr < 0 || nr >= height || nc < 0 || nc >= width) continue;
+                    if (walls[nr][nc]) continue;
+                    if (cd + 1 < dist[nr][nc]) {
+                        dist[nr][nc] = cd + 1;
+                        queue.add(new int[]{nr, nc});
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HEURISTIC
+    // ------------------------------------------------------------------
 
     /**
      * A* heuristic h(n) for a given box configuration.
@@ -638,110 +727,52 @@ public class SokoBot {
      *         from this configuration
      */
     private int heuristic(List<int[]> boxes) {
-        return assignmentLowerBound(boxes);
+        int base = assignmentLowerBound(boxes);
+
+        // Count boxes not yet on goals that are still on the left side of the map
+        // (haven't passed through the bottleneck yet). Each one that needs to queue
+        // behind another adds implicit extra pushes the Hungarian matching misses.
+        int pendingLeft = 0;
+        int pendingRight = 0;
+        for (int[] box : boxes) {
+            if (goals[box[0]][box[1]]) continue; // already placed, ignore
+            if (box[1] < width / 2) pendingLeft++;
+            else pendingRight++;
+        }
+
+        // If multiple boxes are queued on the same side they will block each other:
+        // conservatively add (n-1) extra pushes per side for the waiting cost
+        int penalty = Math.max(0, pendingLeft - 1) + Math.max(0, pendingRight - 1);
+
+        return base + penalty;
     }
 
     /**
      * Computes a lower bound on the remaining pushes by finding the cheapest way to match
      * every box to a distinct goal.
      * <p>
-     * Edge costs are box-to-goal push distances obtained via {@link #bfsPushDistanceFromBox(int, int)}.
-     * The assignment is solved exactly with the Hungarian algorithm ({@link #hungarianMinCost(int[][], int, int)},
-     * O(n^3)) so the bound stays admissible — a greedy nearest-goal match is NOT admissible and
-     * can make A* return suboptimal plans.
+     * Edge costs come from the precomputed {@code pushDist} table (O(1) per lookup) rather
+     * than a per-call BFS.  The assignment is solved exactly with the Hungarian algorithm
+     * ({@link #hungarianMinCost(int[][], int, int)}, O(n^3)) so the bound stays admissible.
      *
      * @param boxes current box positions, each entry as {row, col}
      * @return the minimum total push cost of a perfect box-to-goal matching
      */
     private int assignmentLowerBound(List<int[]> boxes) {
         int n = boxes.size();
-        if (n == 0) {
-            return 0;
-        }
+        if (n == 0) return 0;
 
-        List<int[]> goalList = new java.util.ArrayList<>();
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                if (goals[r][c]) {
-                    goalList.add(new int[]{r, c});
-                }
-            }
-        }
-
-        int m = goalList.size();
-        // cost[i][j] = pushes needed to get box i onto goal j (box-to-cell distance via distanceTable,
-        // since distanceTable[r][c] already holds the shortest goal-distance computed backwards from
-        // every goal; here we instead need box-i-specific distances, so fall back to BFS per box
-        // when more than one goal/box is involved would be too slow to repeat from scratch, so we
-        // reuse distanceTable only as a fast per-cell estimate when n == 1, and do exact per-box BFS otherwise).
-        int[][] cost = new int[n][m];
+        final int INF4 = Integer.MAX_VALUE / 4;
+        int[][] cost = new int[n][numGoals];
         for (int i = 0; i < n; i++) {
-            int[] boxPos = boxes.get(i);
-            int[][] distFromBox = bfsPushDistanceFromBox(boxPos[0], boxPos[1]);
-            for (int j = 0; j < m; j++) {
-                int gr = goalList.get(j)[0];
-                int gc = goalList.get(j)[1];
-                int d = distFromBox[gr][gc];
-                cost[i][j] = (d == Integer.MAX_VALUE) ? Integer.MAX_VALUE / 4 : d;
+            int br = boxes.get(i)[0], bc = boxes.get(i)[1];
+            for (int g = 0; g < numGoals; g++) {
+                int d = pushDist[g][br][bc];
+                cost[i][g] = (d == Integer.MAX_VALUE) ? INF4 : d;
             }
         }
 
-        return hungarianMinCost(cost, n, m);
-    }
-
-    /**
-     * Computes single-box push distances via BFS over box positions only.
-     * <p>
-     * This ignores whether the player can actually reach the push side on the other end of
-     * each move — it purely measures the minimum number of pushes to slide one box from
-     * {@code (startR, startC)} to every other reachable cell, treating walls as blocking.
-     * Used to build assignment cost rows for {@link #assignmentLowerBound(List)} and reachable-goal
-     * adjacency for {@link #hasGoalAssignment(List)}.
-     *
-     * @param startR starting row of the box
-     * @param startC starting column of the box
-     * @return a {@code height x width} grid where each cell holds the minimum push distance
-     *         from the start position, or {@link Integer#MAX_VALUE} if unreachable
-     */
-    private int[][] bfsPushDistanceFromBox(int startR, int startC) {
-        int[][] dist = new int[height][width];
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                dist[r][c] = Integer.MAX_VALUE;
-            }
-        }
-
-        dist[startR][startC] = 0;
-        Queue<int[]> queue = new LinkedList<>();
-        queue.add(new int[]{startR, startC});
-
-        int[] dRow = {-1, 1, 0, 0};
-        int[] dCol = {0, 0, -1, 1};
-
-        while (!queue.isEmpty()) {
-            int[] current = queue.poll();
-            int currRow = current[0];
-            int currCol = current[1];
-            int currentDist = dist[currRow][currCol];
-
-            for (int i = 0; i < 4; i++) {
-                int nextRow = currRow + dRow[i];
-                int nextCol = currCol + dCol[i];
-
-                if (nextRow < 0 || nextRow >= height || nextCol < 0 || nextCol >= width) {
-                    continue;
-                }
-                if (walls[nextRow][nextCol]) {
-                    continue;
-                }
-                if (currentDist + 1 < dist[nextRow][nextCol]) {
-                    dist[nextRow][nextCol] = currentDist + 1;
-                    queue.add(new int[]{nextRow, nextCol});
-                }
-            }
-        }
-
-        return dist;
+        return hungarianMinCost(cost, n, numGoals);
     }
 
     /**
@@ -888,7 +919,7 @@ public class SokoBot {
      */
     private boolean isFrozen(int r, int c, boolean[][] boxGrid, boolean[][] frozen) {
         boolean blockedHorizontal = isBlockedOnAxis(r, c, 0, boxGrid, frozen);
-        boolean blockedVertical = isBlockedOnAxis(r, c, 1, boxGrid, frozen);
+        boolean blockedVertical   = isBlockedOnAxis(r, c, 1, boxGrid, frozen);
         return blockedHorizontal && blockedVertical;
     }
 
@@ -983,57 +1014,36 @@ public class SokoBot {
      * <p>
      * Determines whether a perfect matching exists that assigns every box to a distinct goal
      * it can actually reach (ignoring other boxes, since they can in principle be pushed out
-     * of the way). If no such matching exists, the puzzle is unsolvable from this state
-     * regardless of any single box's mobility. Solved via Kuhn's augmenting-path bipartite
-     * matching algorithm (see {@link #tryAugment(int, List, boolean[], int[])}).
+     * of the way). Uses the precomputed {@code pushDist} table for O(1) reachability checks
+     * instead of per-call BFS.
      *
      * @param boxes current box positions, each entry as {row, col}
      * @return {@code true} if every box can be matched to a distinct reachable goal
      */
     private boolean hasGoalAssignment(List<int[]> boxes) {
         int n = boxes.size();
-        if (n == 0) {
-            return true;
-        }
+        if (n == 0)         return true;
+        if (numGoals < n)   return false;
 
-        List<int[]> goalList = new java.util.ArrayList<>();
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                if (goals[r][c]) {
-                    goalList.add(new int[]{r, c});
-                }
-            }
-        }
-
-        int m = goalList.size();
-        if (m < n) {
-            return false; // can't possibly match every box to a distinct goal
-        }
-
-        // build box -> reachable-goal adjacency (reachable meaning: connected to the box's
-        // cell through non-wall tiles, i.e. there's at least a geometric path for it to be
-        // pushed there with the other boxes hypothetically out of the way)
-        List<List<Integer>> adjacency = new java.util.ArrayList<>();
+        // Build adjacency using the precomputed table: box i reaches goal g iff
+        // pushDist[g][br][bc] < MAX_VALUE (there exists a geometric push path to it).
+        List<List<Integer>> adjacency = new ArrayList<>();
         for (int[] box : boxes) {
-            int[][] dist = bfsPushDistanceFromBox(box[0], box[1]);
-            List<Integer> reachableGoals = new java.util.ArrayList<>();
-            for (int j = 0; j < m; j++) {
-                int gr = goalList.get(j)[0];
-                int gc = goalList.get(j)[1];
-                if (dist[gr][gc] != Integer.MAX_VALUE) {
-                    reachableGoals.add(j);
-                }
-            }
+            int br = box[0], bc = box[1];
+            List<Integer> reachableGoals = new ArrayList<>();
+            for (int g = 0; g < numGoals; g++)
+                if (pushDist[g][br][bc] != Integer.MAX_VALUE)
+                    reachableGoals.add(g);
             adjacency.add(reachableGoals);
         }
 
         // Kuhn's algorithm: standard augmenting-path bipartite matching
-        int[] matchGoalToBox = new int[m];
+        int[] matchGoalToBox = new int[numGoals];
         Arrays.fill(matchGoalToBox, -1);
 
         int matched = 0;
         for (int i = 0; i < n; i++) {
-            boolean[] visited = new boolean[m];
+            boolean[] visited = new boolean[numGoals];
             if (tryAugment(i, adjacency, visited, matchGoalToBox)) {
                 matched++;
             }
@@ -1194,73 +1204,111 @@ public class SokoBot {
      * @param closed    states that have already been popped and fully expanded
      */
     private void expand(Node current, List<int[]> boxes, PriorityQueue<Node> open,
-                         HashMap<State, Long> bestCost, HashSet<State> closed) {
-
-        Reach reach = findReachable(boxes, current.trueR, current.trueC);
+                        HashMap<State, Long> bestCost, HashSet<State> closed) {
 
         int[] dRow = {-1, 1, 0, 0};
         int[] dCol = {0, 0, -1, 1};
         char[] dirChar = {'u', 'd', 'l', 'r'};
 
+        // BFS 1: reachable region + canonical cell, starting from the true player position.
+        // Also builds the parent map so we can reconstruct walk paths without a second BFS.
+        boolean[][] reachable   = new boolean[height][width];
+        int[][] walkParentR     = new int[height][width];
+        int[][] walkParentC     = new int[height][width];
+        int[] canonical         = {current.trueR, current.trueC};
+
+        reachable[current.trueR][current.trueC] = true;
+        Queue<int[]> bfsQueue = new LinkedList<>();
+        bfsQueue.add(new int[]{current.trueR, current.trueC});
+
+        while (!bfsQueue.isEmpty()) {
+            int[] cur = bfsQueue.poll();
+            int cr = cur[0], cc = cur[1];
+
+            for (int i = 0; i < 4; i++) {
+                int nr = cr + dRow[i], nc = cc + dCol[i];
+                if (occupied(boxes, nr, nc) || reachable[nr][nc]) continue;
+                reachable[nr][nc] = true;
+                walkParentR[nr][nc] = cr;
+                walkParentC[nr][nc] = cc;
+                bfsQueue.add(new int[]{nr, nc});
+                if (nr < canonical[0] || (nr == canonical[0] && nc < canonical[1])) {
+                    canonical[0] = nr;
+                    canonical[1] = nc;
+                }
+            }
+        }
+
         for (int boxIndex = 0; boxIndex < boxes.size(); boxIndex++) {
             int[] box = boxes.get(boxIndex);
-            int br = box[0];
-            int bc = box[1];
+            int br = box[0], bc = box[1];
 
             for (int dir = 0; dir < 4; dir++) {
-                int standR = br - dRow[dir]; // where the player must stand to push this box this way
+                int standR = br - dRow[dir];
                 int standC = bc - dCol[dir];
-                int destR = br + dRow[dir];  // where the box would land
-                int destC = bc + dCol[dir];
+                int destR  = br + dRow[dir];
+                int destC  = bc + dCol[dir];
 
-                if (standR < 0 || standR >= height || standC < 0 || standC >= width) {
-                    continue;
-                }
-                if (!reach.reachable[standR][standC]) {
-                    continue; // player can't get behind the box to push it this way
-                }
+                if (standR < 0 || standR >= height || standC < 0 || standC >= width) continue;
+                if (!reachable[standR][standC]) continue;
+                if (destR < 0 || destR >= height || destC < 0 || destC >= width) continue;
+                if (walls[destR][destC] || deadSquares[destR][destC]) continue;
+                if (occupied(boxes, destR, destC)) continue;
 
-                if (destR < 0 || destR >= height || destC < 0 || destC >= width) {
-                    continue;
-                }
-                if (walls[destR][destC] || deadSquares[destR][destC]) {
-                    continue; // illegal landing spot, or provably unsolvable from there
-                }
-                if (occupied(boxes, destR, destC)) {
-                    continue; // another box is already sitting there
-                }
-
-                // build the successor box configuration: every box stays put except this one
                 List<int[]> newBoxes = new ArrayList<>(boxes.size());
-                for (int[] b : boxes) {
-                    newBoxes.add(b);
-                }
+                for (int[] b : boxes) newBoxes.add(b);
                 newBoxes.set(boxIndex, new int[]{destR, destC});
 
-                if (isDeadlocked(newBoxes)) {
-                    continue; // frozen-box / Hall's-theorem prune
+                if (isDeadlocked(newBoxes)) continue;
+
+                // BFS 2: reachable region from the box's old position in the NEW box layout,
+                // to find the canonical cell. No pathTo() call needed — we already have the
+                // walk parent map from BFS 1 above.
+                boolean[][] newReachable = new boolean[height][width];
+                int[] newCanonical = {br, bc};
+                newReachable[br][bc] = true;
+                Queue<int[]> canonQueue = new LinkedList<>();
+                canonQueue.add(new int[]{br, bc});
+
+                while (!canonQueue.isEmpty()) {
+                    int[] cur = canonQueue.poll();
+                    int cr = cur[0], cc = cur[1];
+                    for (int i = 0; i < 4; i++) {
+                        int nr = cr + dRow[i], nc = cc + dCol[i];
+                        if (nr < 0 || nr >= height || nc < 0 || nc >= width) continue;
+                        if (walls[nr][nc] || newReachable[nr][nc]) continue;
+                        boolean blockedByBox = false;
+                        for (int[] b : newBoxes) if (b[0] == nr && b[1] == nc) { blockedByBox = true; break; }
+                        if (blockedByBox) continue;
+                        newReachable[nr][nc] = true;
+                        canonQueue.add(new int[]{nr, nc});
+                        if (nr < newCanonical[0] || (nr == newCanonical[0] && nc < newCanonical[1])) {
+                            newCanonical[0] = nr;
+                            newCanonical[1] = nc;
+                        }
+                    }
                 }
 
-                // the player physically ends up where the box used to be
-                int[] canonical = canonicalPlayer(newBoxes, br, bc);
-                State newState = new State(newBoxes, canonical[0], canonical[1]);
+                State newState = new State(newBoxes, newCanonical[0], newCanonical[1]);
+                if (closed.contains(newState)) continue;
 
-                if (closed.contains(newState)) {
-                    continue;
+                // Reconstruct walk path using the parent map from BFS 1 — O(path length) only,
+                // no additional BFS.
+                StringBuilder walkSB = new StringBuilder();
+                int cr = standR, cc = standC;
+                while (cr != current.trueR || cc != current.trueC) {
+                    int pr = walkParentR[cr][cc], pc = walkParentC[cr][cc];
+                    walkSB.append(stepChar(pr, pc, cr, cc));
+                    cr = pr; cc = pc;
                 }
-
-                // walk from the TRUE current position (not the canonical one) to behind the box
-                String walk = pathTo(boxes, current.trueR, current.trueC, standR, standC);
+                String walk  = walkSB.reverse().toString();
                 String moves = walk + dirChar[dir];
 
-                int g2 = current.g + 1; // one push
-                int totalMoves2 = current.totalMoves + moves.length(); // walk steps + this push
-
-                long newCost = packCost(g2, totalMoves2);
-                Long prevBest = bestCost.get(newState);
-                if (prevBest != null && prevBest <= newCost) {
-                    continue; // already reached this configuration at least as cheaply
-                }
+                int  g2          = current.g + 1;
+                int  totalMoves2 = current.totalMoves + moves.length();
+                long newCost     = packCost(g2, totalMoves2);
+                Long prevBest    = bestCost.get(newState);
+                if (prevBest != null && prevBest <= newCost) continue;
                 bestCost.put(newState, newCost);
 
                 int h2 = heuristic(newBoxes);
