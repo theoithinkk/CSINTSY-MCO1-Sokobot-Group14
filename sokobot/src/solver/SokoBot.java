@@ -1,86 +1,77 @@
 package solver;
 
-import java.util.ArrayDeque; // used for: BFS in distance table computation
-import java.util.ArrayList; // used for: BFS in distance table computation
-import java.util.Arrays;        // used for: passing box positions around
-import java.util.Comparator;   // used for: building successor box configurations
-import java.util.HashMap;      // used for: sorting + hashing the box arrays in State
-import java.util.HashSet; // used for: the A* open list
-import java.util.LinkedList;    // used for: ordering nodes in the open list by lexicographic cost
-import java.util.List;       // used for: best-known-cost bookkeeping (open list dedup)
-import java.util.PriorityQueue;       // used for: the A* closed list
-import java.util.Queue;    // used for: reconstructing the move string in buildPath()
+import java.util.ArrayDeque;    // collects the solution's move segments when we rebuild the path
+import java.util.ArrayList;     // general-purpose lists, mostly the box position lists
+import java.util.Arrays;        // sorting and hashing the box arrays inside State
+import java.util.Comparator;    // orders the nodes waiting in the open list
+import java.util.HashMap;       // bestCost: cheapest known cost we've seen for each state
+import java.util.HashSet;       // closed: states we've already finished expanding
+import java.util.LinkedList;    // the queue type behind every BFS in here
+import java.util.List;          // the box position lists we pass around (List<int[]>)
+import java.util.PriorityQueue; // the A* open list itself
+import java.util.Queue;         // BFS queue interface
 
 public class SokoBot {
 
-    /**
-     * Maximum width of puzzle grid.
-     */
+    // Max width of the puzzle grid
     private int width;
 
-    /**
-     * Maximum height of puzzle grid.
-     */
+    //Max height of the puzzle grid
     private int height;
 
-    /**
-     * 2D Matrix that stores the static walls of the current sokoban puzzle.
-     * - True indicates a wall (unpassable space). Otherwise,
-     * - False indicates a passable space, a box, the player bot, or a goal.
-     */
+    //Matrix for storing the wall locations: True for Wall | False for player, box or a goal
     private boolean[][] walls;
 
-    /**
-     * 2D Matrix mapping target positions for the boxes.
-     * - True indicates a goal is located at the grid coordinates.
-     * - False indicates a non-goal space.
-     */
+    //Matrix for goals: True for goal present here | False for any other grid type
     private boolean[][] goals;
 
-    /**
-     * 2D Matrix that stores the dead squares of the current sokoban puzzle.
-     * - True indicates that the cell is a non-goal space that would make the puzzle unsolvable if boxes are pushed onto them.
-     * - False indicates that the cell is either safe for a box or is a goal.
-     */
+    //Matrix for storing dead tiles: True for making puzzle unsolveable if box goes here | False for safe
     private boolean[][] deadSquares;
 
-    /**
-     * 2D Distance Matrix for Min-Push Heuristic calculation.
-     */
-    private int[][] distanceTable;
-    private int[][][] pushDist;  // [numGoals][height][width]
-    private int[][]   goalPos;   // goalPos[i] = {row, col}
-    private int       numGoals;
+    //Lookup table for push distance | One will exist per goal. Format of matrix is pushDist[g][r][c]
+    //g indicating goal
+    //r and c indicating fewest pushes to move box onto goal
+    private int[][][] pushDist;
+
+    //Maps each goal index to its board coordinates {row, col}.
+    //Used solely to seed the per-goal BFS in computeAllPushDistances()
+    private int[][] goalPos;
+
+    //How many goals the puzzle has
+    private int numGoals;
+
+    // Heuristic weight for weighted A*. Values above 1 trade push-optimality for speed.
+    private static final int H_WEIGHT = 2;
 
 
     /**
-     * Drives the whole solve: parses the puzzle's dynamic items, then runs A* search over
-     * the push-based state space (see {@link #expand} and PART 4 below) until a solved
-     * configuration is found or the time/node budget runs out.
-     * <p>
-     * Two cost components are tracked per search node, compared lexicographically:
-     * pushes first (the conventional Sokoban notion of an optimal solution, and the one the
-     * heuristic in PART 3 actually bounds), then total real keypresses as a tie-break so that,
-     * among multiple routes that all use the minimum number of pushes, the one needing the
-     * least walking in between is preferred. See {@link Node} and {@link #expand} for exactly
-     * how this is enforced.
+     * Runs the whole solve. It reads where the player and boxes start, then searches through
+     * possible box arrangements with A* until it lands on one where every box is on a goal,
+     * or until it runs out of time.
+     *
+     * Every node tracks two numbers: how many pushes it took to get there, and how many total
+     * keypresses (pushes plus all the walking in between). Pushes are what the search mainly
+     * cares about; total keypresses are only a tie-breaker, so when two routes need the same
+     * number of pushes, the one with less walking wins.
+     *
+     * Note the search is weighted, so it favors speed over finding the absolute shortest push
+     * count. It returns a solution that works and fits the time budget, not necessarily the
+     * shortest one.
      *
      * @param width     width of the puzzle grid
      * @param height    height of the puzzle grid
-     * @param mapData   static layout ({@code '#'} walls, {@code '.'} goals)
-     * @param itemsData dynamic layout ({@code '@'} player, {@code '$'} boxes)
-     * @return a string of {@code u}/{@code d}/{@code l}/{@code r} moves that solves the puzzle,
-     *         or {@code ""} if no solution could be found within the time/node budget
+     * @param mapData   the static layout, '#' for walls and '.' for goals
+     * @param itemsData the movable stuff, '@' for the player and '$' for boxes
+     * @return a string of u/d/l/r moves that solves the puzzle, or an empty string if nothing was found in time
      */
     public String solveSokobanPuzzle(int width, int height, char[][] mapData, char[][] itemsData) {
 
-        // Self-imposed budget, comfortably under the harness's hard 15s cutoff. Checked
-        // periodically inside the search loop so a pathological level can't hang forever.
-        long deadline = System.nanoTime() + 14_000_000_000L;
+        //Time budget for the bot to think of a solution
+        long deadline = System.nanoTime() + 15_000_000_000L;
 
         initialize(width, height, mapData, itemsData);
 
-        // --- parse the dynamic items: the player's start cell and every box ---
+        //For parsing dynamic items like the player's start loc and where every box is
         List<int[]> boxes = new ArrayList<>();
         int startPlayerR = -1;
         int startPlayerC = -1;
@@ -97,27 +88,25 @@ public class SokoBot {
             }
         }
 
+        //Unsolvable from the start position
         if (isDeadlocked(boxes)) {
-            return ""; // already unsolvable from the start position, no point searching at all
+            return "";
         }
 
         // --- A* bookkeeping ---
-        // Lexicographic ordering: primary key is f = g + h (pushes), so the search remains
-        // provably push-optimal. Only once two nodes are TIED on f (and on h -- for a goal node
-        // h is always 0, so any two push-tied solutions are tied here too) does totalMoves break
-        // the tie, so the cheaper-to-walk route among equally-pushed solutions wins, rather than
-        // whichever one happens to come off Java's heap first.
+        // The open list is ordered by g + H_WEIGHT*h, with totalMoves as a tie-breaker
+        // so that among equally ranked nodes, the one with less walking comes out first.
         int[] canonicalStart = canonicalPlayer(boxes, startPlayerR, startPlayerC);
         State startState = new State(boxes, canonicalStart[0], canonicalStart[1]);
 
         PriorityQueue<Node> open = new PriorityQueue<>(
-                Comparator.<Node>comparingInt(n -> n.g + n.h)
+                Comparator.<Node>comparingInt(n -> n.g + H_WEIGHT * n.h)
                         .thenComparingInt(n -> n.h)
                         .thenComparingInt(n -> n.totalMoves)
         );
-        // bestCost tracks the lexicographic (pushes, totalMoves) pair per state, packed into a
-        // single long so two states can be compared with one numeric comparison. totalMoves is
-        // bounded well under 1,000,000 by the time/node budget below, so this packing is safe.
+
+        //bestCost stores the best (pushes, totalMoves) cost seen so far for each state,
+        //All paacked into a single long for easy comparison.
         HashMap<State, Long> bestCost = new HashMap<>();
         HashSet<State> closed = new HashSet<>();
 
@@ -125,24 +114,19 @@ public class SokoBot {
         open.add(startNode);
         bestCost.put(startState, packCost(0, 0));
 
-        // Hard safety valve on memory/time independent of the wall-clock check, in case a
-        // level's reachable state space is enormous (mainly a concern for dense 8-box levels).
-        final int MAX_NODES = 2_000_000;
-        int nodesExpanded = 0;
-
+        //Keep pulling the lowest-cost node until the puzzle is solved or time runs out
         while (!open.isEmpty()) {
 
-            if (nodesExpanded > MAX_NODES || System.nanoTime() > deadline) {
-                return ""; // out of budget; let the harness report "took too long" instead of returning a guess
+            if (System.nanoTime() > deadline) {
+                return "";
             }
 
             Node current = open.poll();
 
             if (closed.contains(current.state)) {
-                continue; // stale duplicate left behind by lazy deletion from the open list
+                continue;
             }
             closed.add(current.state);
-            nodesExpanded++;
 
             List<int[]> currentBoxes = stateToBoxList(current.state);
 
@@ -153,254 +137,185 @@ public class SokoBot {
             expand(current, currentBoxes, open, bestCost, closed);
         }
 
-        return ""; // open list exhausted with no goal found: this level is unsolvable
+        return ""; //No solution found
     }
 
     /**
      * ===========================================================================================
      * PART 1: BOARD REPRESENTATION AND PREPROCESSING
-     * - initialize(): gets how the board looks like
-     * - computeDeadSquares(): marks non goal corner cells as dead squares cus any box pushed into those cells can never be moved into a goal
-     * - computeBoxGoalDistances(): computes backwards from a goal that results in a table that has a lower bound on how many pushes a box needs to reach each goal
+     * - initialize(): reads the raw map into the wall/goal grids, then kicks off the prep below
+     * - computeDeadSquares(): marks non-goal cells a box can never escape from (corners and dead
+     *   corridors), so the search can refuse to push a box there in the first place
+     * - computeAllPushDistances(): builds the per-goal push-distance tables the heuristic relies on
+     * - computeBoxGoalDistances(): older nearest-goal distance table, currently unused (see its doc)
      * ============================================================================================
      */
 
     /**
-     * Initializes the puzzle board representation of the Sokoban puzzle
-     * 
-     * <p> This method parses the map data to classify which tiles of the puzzle 
-     * are walls or goals before storing them in their dedicated 2D matrices. Once the
-     * basic board information is extracted, the preprocessing methods computeDeadSquares() 
-     * and computeBoxGoalDistances() are called, both of which implemented to help the solver 
-     * further on in the program as it searches for a solution to the puzzle. </p>
-     * 
-     * @param width the width of the puzzle board
-     * @param height the height of the puzzle board
-     * @param mapData the board layout containing walls and goals of the current Sokoban puzzle 
-     * @param itemsData the board layout containing the player and the boxes of the current Sokoban puzzle
+     * Sets up the board before the search starts.
+     * Reads the raw map and marks which cells are walls and which are goals into their own
+     * grids. Then runs two preprocessing steps the search relies on later: dead square detection
+     * (cells to never push a box onto) and the push distance tables the heuristic reads from.
+     *
+     * @param width     the width of the puzzle board
+     * @param height    the height of the puzzle board
+     * @param mapData   the static layout: walls and goals
+     * @param itemsData the movable layout: the player and the boxes
      */
-
     private void initialize(int width, int height, char[][] mapData, char[][] itemsData) {
 
         this.width = width;
         this.height = height;
 
-        // instantiate the walls and goals matrices based on the map data
+        //Instantiate the walls and goals matrices based on the map data
         this.walls = new boolean[height][width];
         this.goals = new boolean[height][width];
 
-        // main loop for puzzle board parsing
+        //Main loop for puzzle board parsing
         for (int r = 0; r < height; r++) {
             for (int c = 0; c < width; c++) {
                 char staticTile = mapData[r][c];
 
-                //case 1: wall detection (set walls[r][c] to true if there is a wall at (r, c))
+                //Wall detection (set walls[r][c] to true if there is a wall at (r, c))
                 if (staticTile == '#') {
                     this.walls[r][c] = true;
                 }
-                //case 2: goal detection (set goals[r][c] to true if there is a goal at (r, c))
+                //Goal detection (set goals[r][c] to true if there is a goal at (r, c))
                 else if (staticTile == '.') {
                     this.goals[r][c] = true;
                 }
             }
         }
 
-        computeDeadSquares(); //based on the extracted walls and goals, compute the dead squares of the puzzle to avoid.
-        computeAllPushDistances();
-        computeBoxGoalDistances(); //based on the extracted walls and goals, compute the distance table for the min-push heuristic.
-
+        computeDeadSquares();      //Find cells a box could get permanently stuck on
+        computeAllPushDistances(); //Build the per-goal push-distance tables the heuristic uses
     }
 
     /**
-     * Classifies which tiles are dead squares on the Sokoban board and marks them through a 2D matrix
-     * 
-     * <p> A dead square is any non-goal tile in the board which can make the puzzle unsolvable
-     * once a box is pushed onto that position. Marking the dead squares of the puzzle during
-     * the preprocessing stage allows the solver to avoid moves that would inevitably lead to an unsolvable state. </p>
-     * 
-     * <p> Two cases of dead squares are detected in this method. First, it loops through the board
-     * to mark dead corners, which are all non-goal tiles that are adjacent to walls on two
-     * perpendicular sides. Second, it scans the board again to identify dead corridors which are sequences
-     * of non-goal tiles between two dead corners that lie along a continuous wall and contain no goal tiles. </p>
-     * 
-     * <p> The dead-square statuses of the tiles are stored in the {@code deadSquares} matrix, where tiles marked 
-     * {@code true} indicates that the solver should avoid that tile while searching for a path. </p>
+     * Classifies which tiles are dead squares on the Sokoban board and marks them in a 2D matrix.
+     *
+     * A dead square is any non-goal tile where pushing a box onto it makes the puzzle unsolvable.
+     * Marking these during preprocessing lets the solver avoid moves that inevitably lead to a dead end.
+     *
+     * Two cases are detected: dead corners, which are non-goal tiles adjacent to walls on two
+     * perpendicular sides, and dead corridors, which are sequences of non-goal tiles between two
+     * dead corners that run along a continuous wall and contain no goals.
+     *
+     * Results are stored in the deadSquares matrix, where true means the solver should never
+     * push a box onto that tile.
      */
     private void computeDeadSquares() {
 
-      this.deadSquares = new boolean[height][width];
+        this.deadSquares = new boolean[height][width];
 
-      //Case 1: Dead Corner Detection (mark every corner that is a non-goal square as a dead square, since any box pushed into that cell can never be moved into a goal.)
-      for (int r = 0; r < height; r++) {
-          for (int c = 0; c < width; c++) {
-              // Exclude coordinates holding blocking structures or valid goals
-              if (walls[r][c] || goals[r][c]) {
-                  continue;
-              }
-
-              boolean wallNorth = (r - 1 >= 0) && walls[r - 1][c];
-              boolean wallSouth = (r + 1 < height) && walls[r + 1][c];
-              boolean wallWest = (c - 1 >= 0) && walls[r][c - 1];
-              boolean wallEast = (c + 1 < width) && walls[r][c + 1];
-
-              // Mark the tile as a dead square if it is a corner
-              if ((wallNorth && wallEast) ||
-                      (wallEast && wallSouth) ||
-                      (wallSouth && wallWest) ||
-                      (wallWest && wallNorth)) {
-
-                  this.deadSquares[r][c] = true;
-              }
-          }
-      }
-
-      //Case 2: Dead Square Detection (mark every non-goal square that is in a dead-square corridor, except for corridors that have goals)
-      for (int r = 0; r < height; r++) { 
-          for (int c = 0; c < width; c++) {
-
-              if (!deadSquares[r][c] || goals[r][c]) { //start only if it is already marked as a dead square and is not a goal
-                  continue;
-              }
-
-              int column = c + 1; // scan to the right
-              boolean goalDetected = false;
-
-              while (column < width && !walls[r][column]) { // traverse until a wall is reached
-                  if (goals[r][column]) {
-                      goalDetected = true;
-                      break; // if goal has been detected, do not mark the corridor as a dead corridor
-                  }
-
-                  if (deadSquares[r][column]) {
-                      boolean wallNorth = true;
-                      boolean wallSouth = true;
-
-                      for (int check = c; check <= column; check++) { //corridor is only valid if atleast one side of the corridor is a continuous wall (for it to be completely dead)
-                          // check if wall above is broken
-                          if (r - 1 < 0 || !walls[r - 1][check]) {
-                              wallNorth = false;
-                          }
-                          // check if wall below is broken
-                          if (r + 1 >= height || !walls[r + 1][check]) {
-                              wallSouth = false;
-                          }
-                      }
-
-                      if (!goalDetected && (wallNorth || wallSouth)) {
-                          for (int dead = c; dead <= column; dead++) {
-                              deadSquares[r][dead] = true;
-                          }
-                      }
-                      break;
-                  }
-                  column++;
-              }
-          }
-      }
-
-      for (int r = 0; r < height; r++) {
-          for (int c = 0; c < width; c++) {
-
-            if (!deadSquares[r][c] || goals[r][c]) { //start only if it is already marked as a dead square and is not a goal
-              continue;
-            }
-
-            int row = r + 1;
-            boolean goalDetected = false;
-
-            while (row < height && !walls[row][c]) {
-
-                if (goals[row][c]) {
-                    goalDetected = true;
-                    break;
+        //Case 1: Dead Corner Detection (mark every corner that is a non-goal square as a dead square, since any box pushed into that cell can never be moved into a goal.)
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                // Exclude coordinates holding blocking structures or valid goals
+                if (walls[r][c] || goals[r][c]) {
+                    continue;
                 }
 
-                if (deadSquares[row][c]) {
-                    boolean wallWest = true;
-                    boolean wallEast = true;
+                boolean wallNorth = (r - 1 >= 0) && walls[r - 1][c];
+                boolean wallSouth = (r + 1 < height) && walls[r + 1][c];
+                boolean wallWest = (c - 1 >= 0) && walls[r][c - 1];
+                boolean wallEast = (c + 1 < width) && walls[r][c + 1];
 
-                    for (int check = r; check <= row; check++) {
-                      // Check if left wall is continuous
-                      if (c - 1 < 0 || !walls[check][c - 1]) {
-                          wallWest = false;
-                      }
-                      // Check if right wall is continuous
-                      if (c + 1 >= width || !walls[check][c + 1]) {
-                          wallEast = false;
-                      }
+                //Mark the tile as a dead square if it is a corner
+                if ((wallNorth && wallEast) ||
+                        (wallEast && wallSouth) ||
+                        (wallSouth && wallWest) ||
+                        (wallWest && wallNorth)) {
+
+                    this.deadSquares[r][c] = true;
+                }
+            }
+        }
+
+        //Case 2: Dead Square Detection (mark every non-goal square that is in a dead-square corridor, except for corridors that have goals)
+        for (int r = 0; r < height; r++) {
+            for (int c = 0; c < width; c++) {
+                //start only if it is already marked as a dead square and is not a goal
+                if (!deadSquares[r][c] || goals[r][c]) {
+                    continue;
+                }
+                //Scan to the right
+                int column = c + 1;
+                boolean goalDetected = false;
+                //Traverse until a wall is reached and if goal has been detected, do not mark the corridor as a dead corridor
+                while (column < width && !walls[r][column]) {
+                    if (goals[r][column]) {
+                        goalDetected = true;
+                        break;
                     }
 
-                    if (!goalDetected && (wallWest || wallEast)) {
-                        for (int dead = r; dead <= row; dead++) {
-                            deadSquares[dead][c] = true;
+                    if (deadSquares[r][column]) {
+                        boolean wallNorth = true;
+                        boolean wallSouth = true;
+                        //Corridor is only valid if atleast one side of the corridor is a continuous wall (for it to be completely dead)
+                        for (int check = c; check <= column; check++) {
+                            //Check if wall above is broken
+                            if (r - 1 < 0 || !walls[r - 1][check]) {
+                                wallNorth = false;
+                            }
+                            //Check if wall below is broken
+                            if (r + 1 >= height || !walls[r + 1][check]) {
+                                wallSouth = false;
+                            }
                         }
+
+                        if (!goalDetected && (wallNorth || wallSouth)) {
+                            for (int dead = c; dead <= column; dead++) {
+                                deadSquares[r][dead] = true;
+                            }
+                        }
+                        break;
                     }
-                    break;
+                    column++;
                 }
-                row++;
-              }
-          }
-      }
-    }
-
-    /**
-     * Computes the distance from every reachable tile on the board to the nearest 
-     * goal tile
-     * 
-     * <p> The second method of the preprocessing phase performs a BFS starting from all goal
-     * locations simulataneously. Each goal is assigned to a distance value of {@code 0}, and neighboring
-     * tiles are explored in order of increasing distance.</p> 
-     * 
-     * <p> The resulting distances are stored in the 2D matrix {@code distanceTable}. For every
-     * reachable tile, the recorded value represents the length of the shortest path found to a 
-     * nearest goal tile. Tiles that cannot reach any goal remain assigned {@code Integer.MAX_VALUE}.
-     * The resulting distance table of this method will be later used by the solver to determine 
-     * which boxes are positioned closer to goal tiles.</p>
-     */
-    private void computeBoxGoalDistances() {
-
-        this.distanceTable = new int[height][width]; //setup distance table, assume every tile is unreachable
-
-        for (int r = 0; r < height; r++) {
-            for (int c = 0; c < width; c++) {
-                this.distanceTable[r][c] = Integer.MAX_VALUE;
             }
         }
 
-        Queue<int[]> queue = new LinkedList<>();
-
         for (int r = 0; r < height; r++) {
             for (int c = 0; c < width; c++) {
-                if (goals[r][c]) {
-                    this.distanceTable[r][c] = 0; //locate all goals and set distance value to 0
-                    queue.add(new int[]{r, c});
-                } //then, load to queue
-            }
-        }
+                //Start only if it is already marked as a dead square and is not a goal
+                if (!deadSquares[r][c] || goals[r][c]) {
+                    continue;
+                }
 
-        int[] dRow = {-1, 1, 0, 0};
-        int[] dCol = {0, 0, -1, 1};
+                int row = r + 1;
+                boolean goalDetected = false;
 
-        while (!queue.isEmpty()) { //will loop until every tile has been evaluated
-            int[] current = queue.poll();
-            int currRow = current[0];
-            int currCol = current[1];
-            int currentDist = this.distanceTable[currRow][currCol];
+                while (row < height && !walls[row][c]) {
 
-            for (int i = 0; i < 4; i++) { // check the current cell's neighboring tiles (using direction vectors)
-
-                int nextRow = currRow + dRow[i];
-                int nextCol = currCol + dCol[i];
-
-                if (nextRow >= 0 && nextRow < height && nextCol >= 0 && nextCol < width) {
-                    if (walls[nextRow][nextCol]) { //skip if neighboring tile is a wall
-                        continue;
+                    if (goals[row][c]) {
+                        goalDetected = true;
+                        break;
                     }
 
-                    if (currentDist + 1 < this.distanceTable[nextRow][nextCol]) { //if shorter path is found, update distance table and push neighbor to the queue
-                        this.distanceTable[nextRow][nextCol] = currentDist + 1;
-                        queue.add(new int[]{nextRow, nextCol});
+                    if (deadSquares[row][c]) {
+                        boolean wallWest = true;
+                        boolean wallEast = true;
+
+                        for (int check = r; check <= row; check++) {
+                            //Check if left wall is continuous
+                            if (c - 1 < 0 || !walls[check][c - 1]) {
+                                wallWest = false;
+                            }
+                            //Check if right wall is continuous
+                            if (c + 1 >= width || !walls[check][c + 1]) {
+                                wallEast = false;
+                            }
+                        }
+
+                        if (!goalDetected && (wallWest || wallEast)) {
+                            for (int dead = r; dead <= row; dead++) {
+                                deadSquares[dead][c] = true;
+                            }
+                        }
+                        break;
                     }
+                    row++;
                 }
             }
         }
@@ -412,17 +327,24 @@ public class SokoBot {
      * - occupied(): quick check if a cell is blocked for the player (wall or box)
      * - findReachable(): BFS that checks every cell the player can walk to without pushing a box
      * - canonicalPlayer(): collapses the player's whole reachable region down to one cell
-     * - pathTo(): BFS that rebuilds the actual u/d/l/r moves to walk from one cell to another
      * - Reach (class): the result of findReachable (reachable grid + canonical cell)
      * - State (class): one search node (box layout + canonical player) with equals/hashCode
      * ============================================================================================
      */
 
-    // its blocked if its off the grid, a wall, or one of the boxes is sitting on it.
-    // goals dont block the player
+    /**
+     * Checks whether the player is blocked from standing on a cell. A cell counts as blocked if
+     * it's off the grid, a wall, or has a box sitting on it. Goals don't block anyone, so the
+     * player can freely walk over an empty goal.
+     *
+     * @param boxes the current box positions
+     * @param r     row to check
+     * @param c     column to check
+     * @return true if the player can't be on that cell
+     */
     private boolean occupied(List<int[]> boxes, int r, int c) {
         if (r < 0 || r >= height || c < 0 || c >= width) {
-            return true; // off-grid counts as blocked so no need to bounds-check everywhere else
+            return true; //Off-grid counts as blocked so no need to bounds-check everywhere else
         }
         if (walls[r][c]) {
             return true;
@@ -435,6 +357,21 @@ public class SokoBot {
         return false;
     }
 
+    /**
+     * Floods outward from the player to find every cell they can walk to without pushing any box,
+     * using a plain BFS. Along the way it also tracks the canonical cell for that whole region:
+     * the top-left-most reachable cell, scanning by row then column.
+     *
+     * Why the canonical cell matters: as long as the boxes don't move, it doesn't matter exactly
+     * where in a region the player is standing, since they can reach any of it for free. Collapsing
+     * the whole region to one fixed cell lets two otherwise-identical board states count as the
+     * same state, which keeps the search from exploring the same thing over and over.
+     *
+     * @param boxes   the current box positions
+     * @param playerR the player's row
+     * @param playerC the player's column
+     * @return a Reach holding the reachable-cell grid and that region's canonical cell
+     */
     private Reach findReachable(List<int[]> boxes, int playerR, int playerC) {
         boolean[][] reachable = new boolean[height][width];
         Queue<int[]> queue = new LinkedList<>();
@@ -442,32 +379,30 @@ public class SokoBot {
         reachable[playerR][playerC] = true;
         queue.add(new int[]{playerR, playerC});
 
-        // canonical = top left most cell in the whole region. start it at the player, then update it.
+        //Canonical = top left most cell in the whole region. start it at the player, then update it.
         int[] canonical = new int[]{playerR, playerC};
 
         int[] dRow = {-1, 1, 0, 0};
         int[] dCol = {0, 0, -1, 1};
-
-        while (!queue.isEmpty()) { // loops until the whole region is checked
+        //Loops until the whole region is checked
+        while (!queue.isEmpty()) {
             int[] current = queue.poll();
             int currRow = current[0];
             int currCol = current[1];
-
-            for (int i = 0; i < 4; i++) { // check the current tile's neighbors
+            //Check the current tile's neighbors
+            for (int i = 0; i < 4; i++) {
                 int nextRow = currRow + dRow[i];
                 int nextCol = currCol + dCol[i];
-
-                if (occupied(boxes, nextRow, nextCol)) { // skip walls, boxes, off grid
-                    continue;
-                }
-                if (reachable[nextRow][nextCol]) { // skip tiles already checked
+                //Skip walls, boxes, off-grid, and already-visited tiles
+                if (occupied(boxes, nextRow, nextCol) || reachable[nextRow][nextCol]) {
                     continue;
                 }
 
-                reachable[nextRow][nextCol] = true; // mark as reachable, then load to queue
+                //Mark as reachable, then load to queue
+                reachable[nextRow][nextCol] = true;
                 queue.add(new int[]{nextRow, nextCol});
 
-                // update canonical if we found a cell higher up, or further left on the same row
+                //Update canonical if we found a cell higher up, or further left on the same row
                 if (nextRow < canonical[0] || (nextRow == canonical[0] && nextCol < canonical[1])) {
                     canonical[0] = nextRow;
                     canonical[1] = nextCol;
@@ -478,90 +413,45 @@ public class SokoBot {
         return new Reach(reachable, canonical);
     }
 
+    /**
+     * Shortcut that runs findReachable and hands back just the canonical cell, for when
+     * the caller only needs that one representative cell and not the full reachable grid.
+     *
+     * @param boxes   the current box positions
+     * @param playerR the player's row
+     * @param playerC the player's column
+     * @return the {row, col} of the region's canonical (top-left-most) cell
+     */
     private int[] canonicalPlayer(List<int[]> boxes, int playerR, int playerC) {
         return findReachable(boxes, playerR, playerC).canonical;
     }
 
-
-    private String pathTo(List<int[]> boxes, int fromR, int fromC, int toR, int toC) {
-        if (fromR == toR && fromC == toC) {
-            return ""; // already there, no moves needed
-        }
-
-        boolean[][] visited = new boolean[height][width];
-        int[][] parentRow = new int[height][width]; // tracks which row i came from
-        int[][] parentCol = new int[height][width]; // tracks which col i came from
-
-        Queue<int[]> queue = new LinkedList<>();
-
-        visited[fromR][fromC] = true;
-        queue.add(new int[]{fromR, fromC});
-
-        int[] dRow = {-1, 1, 0, 0};
-        int[] dCol = {0, 0, -1, 1};
-
-        boolean found = false;
-        while (!queue.isEmpty() && !found) {
-            int[] current = queue.poll();
-            int currRow = current[0];
-            int currCol = current[1];
-
-            for (int i = 0; i < 4; i++) {
-                int nextRow = currRow + dRow[i];
-                int nextCol = currCol + dCol[i];
-
-                if (occupied(boxes, nextRow, nextCol)) { // skip walls/boxes/off-grid
-                    continue;
-                }
-                if (visited[nextRow][nextCol]) { // already reached on an equal-or-shorter path, skip
-                    continue;
-                }
-
-                visited[nextRow][nextCol] = true;
-                parentRow[nextRow][nextCol] = currRow; // remember where this tile came from
-                parentCol[nextRow][nextCol] = currCol;
-
-                if (nextRow == toR && nextCol == toC) { // hit the target, stop early
-                    found = true;
-                    break;
-                }
-                queue.add(new int[]{nextRow, nextCol});
-            }
-        }
-
-        if (!visited[toR][toC]) {
-            return null; // target wasnt reachable (shouldnt happen for tiles inside the region)
-        }
-
-        // walk the parent chain from target back to start, collecting moves in reverse
-        StringBuilder reversed = new StringBuilder();
-        int curR = toR;
-        int curC = toC;
-
-        while (curR != fromR || curC != fromC) {
-            int pR = parentRow[curR][curC];
-            int pC = parentCol[curR][curC];
-
-            reversed.append(stepChar(pR, pC, curR, curC));
-            curR = pR;
-            curC = pC;
-        }
-
-        return reversed.reverse().toString(); // flip it so it reads start -> target
-    }
-
-    // turns one single-tile step (from -> to) into its move letter.
+    /**
+     * Turns a single one-cell step into its move letter. Assumes from and to are
+     * neighbors, so the four cases cover every possibility.
+     *
+     * @param fromR row stepped from
+     * @param fromC column stepped from
+     * @param toR   row stepped to
+     * @param toC   column stepped to
+     * @return u, d, l, or r
+     */
     private char stepChar(int fromR, int fromC, int toR, int toC) {
-        if (toR == fromR - 1) return 'u';
-        if (toR == fromR + 1) return 'd';
-        if (toC == fromC - 1) return 'l';
-        return 'r'; // only case left: toC == fromC + 1
+        if (toR == fromR - 1) return 'u'; //Moved one row up
+        if (toR == fromR + 1) return 'd'; //Moved one row down
+        if (toC == fromC - 1) return 'l'; //Moved one column left
+        return 'r';                       //Moved one column right
     }
 
+    /**
+     * The two things findReachable produces: a grid of where the player can walk, and the
+     * one canonical cell that stands in for that whole region. Just a small bundle so the method
+     * can hand back both at once.
+     */
     private static class Reach {
-        // reachable[r][c] == true means the player can walk there without pushing a box.
+        //Reachable[r][c] is true if the player can walk to that cell without pushing a box.
         final boolean[][] reachable;
-        // the single representative cell for the whole region (the top-left most).
+        //The region's stand-in cell: the top-left-most reachable cell.
         final int[] canonical;
 
         Reach(boolean[][] reachable, int[] canonical) {
@@ -570,14 +460,29 @@ public class SokoBot {
         }
     }
 
+    /**
+     * One snapshot of the puzzle the search treats as a single state: where all the boxes are, plus
+     * the canonical player cell. Two States are equal when the boxes match and the player's region
+     * matches, which is what lets the search recognize when it's reached the same situation again
+     * and skip re-exploring it.
+     *
+     * The boxes get sorted on the way in so that the same set of boxes always produces the same
+     * array no matter what order they came in. Without that, two identical boards could look
+     * different just because their box lists were ordered differently. The hash is computed once in
+     * the constructor and cached, since this gets dropped into hash maps and sets constantly.
+     */
     private static class State {
-        final int[][] boxes;     // sorted 2D array of box coordinates
-        final int playerR;       // canonical player row
-        final int playerC;       // canonical player column
-        private final int hash;  // cached so hashCode() stays fast (O(1))
+        //Box coordinates, sorted by row then column so equal boards always look equal
+        final int[][] boxes;
+        //The canonical player row (top-left-most cell of the reachable region)
+        final int playerR;
+        //The canonical player column.
+        final int playerC;
+        //Precomputed hash, cached so hashCode() stays cheap
+        private final int hash;
 
         State(List<int[]> boxList, int playerR, int playerC) {
-            // pull the boxes into a 2D array and sort them by row first, then column
+            //Pull the boxes into a 2D array and sort them by row first, then column
             int[][] boxArray = new int[boxList.size()][2];
             for (int i = 0; i < boxList.size(); i++) {
                 boxArray[i][0] = boxList.get(i)[0];
@@ -594,6 +499,7 @@ public class SokoBot {
             this.hash = computeHash(boxArray, playerR, playerC);
         }
 
+        //Builds the cached hash from the sorted boxes and the player cell
         private static int computeHash(int[][] boxes, int playerR, int playerC) {
             int h = Arrays.deepHashCode(boxes);
             h = 31 * h + playerR;
@@ -606,6 +512,10 @@ public class SokoBot {
             return hash;
         }
 
+        /**
+         * Two States match when the player's canonical cell is the same and all box positions line
+         * up. The boxes were sorted in the constructor, so a straight array compare is enough.
+         */
         @Override
         public boolean equals(Object other) {
             if (this == other) return true;
@@ -621,48 +531,35 @@ public class SokoBot {
     /**
      * ===========================================================================================
      * PART 3: HEURISTICS AND DEADLOCK DETECTION
-     * - heuristic(): A* h(n), wraps the goal-assignment lower bound
-     * - assignmentLowerBound(): min-cost perfect matching of boxes to goals (Hungarian algorithm)
-     * - isDeadlocked(): orchestrates freeze-deadlock + goal-assignment-feasibility checks
-     * - isFrozen(): checks whether a single box can never be pushed again
-     * - isBlockedOnAxis() / isBlockedSide(): freeze-deadlock helpers, one axis at a time
-     * - hasGoalAssignment(): Hall's-theorem style feasibility check (perfect bipartite matching exists)
-     * - isSolved(): every box currently sits on a goal
+     * - computeAllPushDistances(): precomputes how many pushes it takes to reach each goal from any cell
+     * - heuristic(): estimates how many pushes are still needed from the current box layout
+     * - assignmentLowerBound(): finds the cheapest way to assign every box to a distinct goal
+     * - hungarianMinCost(): solves the assignment problem using the Hungarian algorithm
+     * - isDeadlocked(): checks if the current box layout can never lead to a solution
+     * - isFrozen(): checks if a single box is permanently stuck
+     * - isBlockedOnAxis() / isBlockedSide(): helpers for the freeze check, one axis at a time
+     * - hasGoalAssignment(): checks if every box can still reach a distinct goal
+     * - tryAugment(): helper for the goal assignment check
+     * - isSolved(): checks if every box is on a goal
      *
-     * KEY OPTIMIZATION over the original:
-     *   The original called bfsPushDistanceFromBox() — a full O(height*width) BFS — inside both
-     *   assignmentLowerBound() and hasGoalAssignment() on every generated successor node.
-     *   With 5 boxes and 200,000 node expansions that is millions of BFS runs.
-     *
-     *   The fix: precompute pushDist[goalIndex][r][c] ONCE in initialize() by running one
-     *   backwards BFS per goal.  During search every cost lookup becomes an O(1) table read.
-     *   Two new fields are required in the enclosing class:
-     *
-     *       private int[][][] pushDist;   // [numGoals][height][width], filled by computeAllPushDistances()
-     *       private int[][]   goalPos;    // goalPos[i] = {row, col} for goal i
-     *       private int       numGoals;
-     *
-     *   Call computeAllPushDistances() from initialize(), after walls/goals are parsed.
+     * Distances are precomputed because the heuristic and deadlock check both need to know how
+     * far each box is from each goal on every state the search visits. Running a fresh BFS for
+     * that each time would be very slow, so computeAllPushDistances() does it all once at startup
+     * and stores the results in a table. Every distance lookup during the search is then instant.
      * ============================================================================================
      */
 
-    // ------------------------------------------------------------------
-    // PREPROCESSING — call this from initialize() after walls/goals ready
-    // ------------------------------------------------------------------
-
     /**
-     * Precomputes push distances from every board cell to every goal.
-     * <p>
-     * Runs one backwards BFS <em>per goal</em> over the box-push graph (walls block,
-     * every non-wall step costs 1 push).  Stores results in {@code pushDist[g][r][c]}.
-     * <p>
-     * Total cost: O(numGoals * height * width) — paid once at startup.
-     * Without this, the original code recomputed equivalent BFS data inside
-     * {@code assignmentLowerBound} and {@code hasGoalAssignment} on every node expansion,
-     * which was O(numBoxes * numGoals * height * width) <em>per node</em>.
+     * Builds a table of push distances from every cell to every goal.
+     *
+     * Runs one BFS per goal starting from that goal's position outward. For each cell it
+     * records how many pushes a box would need to reach that goal from there. Results are
+     * stored in pushDist indexed by [goal][row][col].
+     *
+     * This runs once at startup so the search never has to recompute distances on the fly.
      */
     private void computeAllPushDistances() {
-        // Collect goal positions
+        //Collect the (row, col) of every goal tile on the board
         List<int[]> goalList = new ArrayList<>();
         for (int r = 0; r < height; r++)
             for (int c = 0; c < width; c++)
@@ -678,22 +575,23 @@ public class SokoBot {
         for (int g = 0; g < numGoals; g++) {
             int[][] dist = pushDist[g];
             for (int[] row : dist) Arrays.fill(row, Integer.MAX_VALUE);
-
+            //The goal itself costs 0 pushes — a box already there needs no moves
             int gr = goalPos[g][0], gc = goalPos[g][1];
             dist[gr][gc] = 0;
 
             Queue<int[]> queue = new LinkedList<>();
             queue.add(new int[]{gr, gc});
-
+            //BFS expanding outward from the goal; each step = one more push needed
             while (!queue.isEmpty()) {
-                int[] cur  = queue.poll();
-                int   cr   = cur[0], cc = cur[1];
-                int   cd   = dist[cr][cc];
+                int[] cur = queue.poll();
+                int cr  = cur[0], cc = cur[1];
+                int cd  = dist[cr][cc];
 
                 for (int i = 0; i < 4; i++) {
                     int nr = cr + dRow[i], nc = cc + dCol[i];
                     if (nr < 0 || nr >= height || nc < 0 || nc >= width) continue;
-                    if (walls[nr][nc]) continue;
+                    if (walls[nr][nc]) continue; //Walls are impassable for boxes
+                    // Only update if we found a cheaper route to this neighbor
                     if (cd + 1 < dist[nr][nc]) {
                         dist[nr][nc] = cd + 1;
                         queue.add(new int[]{nr, nc});
@@ -703,53 +601,45 @@ public class SokoBot {
         }
     }
 
-    // ------------------------------------------------------------------
-    // HEURISTIC
-    // ------------------------------------------------------------------
-
     /**
-     * A* heuristic h(n) for a given box configuration.
-     * <p>
-     * Must never overestimate the true number of pushes remaining (admissibility), so it
-     * simply delegates to {@link #assignmentLowerBound(List)}.
+     * Estimates how many pushes are still needed from the current box layout.
+     * Delegates to assignmentLowerBound, which finds the true minimum by matching
+     * every box to a distinct goal as cheaply as possible.
      *
-     * @param boxes current box positions, each entry as {row, col}
-     * @return an admissible lower bound on the number of pushes needed to solve the puzzle
-     *         from this configuration
+     * This estimate never overshoots the real answer, so the search stays correct.
+     * The one place we trade solution quality for speed is the H_WEIGHT multiplier
+     * in the open list, not here.
+     *
+     * @param boxes current box positions, each as {row, col}
+     * @return a lower bound on the number of pushes still needed
      */
     private int heuristic(List<int[]> boxes) {
-        // NOTE: a previous revision added a hardcoded left/right "bottleneck" penalty here.
-        // Removed: it assumed every level has a single congestion point at width/2, which is
-        // not generally true, and an inflated h(n) breaks A*'s admissibility guarantee --
-        // meaning the search is no longer provably push-optimal, and combined with the
-        // bestCost/closed-set pruning below, can permanently prune the true optimal path.
-        // The pushDist precomputation already removes the per-node BFS cost that this penalty
-        // was almost certainly compensating for; rely on that instead of an unsound heuristic.
         return assignmentLowerBound(boxes);
     }
 
     /**
-     * Computes a lower bound on the remaining pushes by finding the cheapest way to match
-     * every box to a distinct goal.
-     * <p>
-     * Edge costs come from the precomputed {@code pushDist} table (O(1) per lookup) rather
-     * than a per-call BFS.  The assignment is solved exactly with the Hungarian algorithm
-     * ({@link #hungarianMinCost(int[][], int, int)}, O(n^3)) so the bound stays admissible.
+     * Finds the cheapest way to assign every box to a distinct goal and returns the total cost.
+     * Uses the precomputed pushDist table so each box-to-goal cost is just a table lookup.
+     * The assignment itself is solved with the Hungarian algorithm.
      *
      * @param boxes current box positions, each entry as {row, col}
-     * @return the minimum total push cost of a perfect box-to-goal matching
+     * @return the minimum total push cost of matching all boxes to distinct goals
      */
     private int assignmentLowerBound(List<int[]> boxes) {
         int n = boxes.size();
         if (n == 0) return 0;
 
+        // INF4 instead of MAX_VALUE to prevent overflow when the Hungarian algorithm
+        // does arithmetic on these costs (e.g. subtraction in the dual variable updates)
         final int INF4 = Integer.MAX_VALUE / 4;
+
+        // Build the n x numGoals cost matrix from the precomputed push-distance table
         int[][] cost = new int[n][numGoals];
         for (int i = 0; i < n; i++) {
             int br = boxes.get(i)[0], bc = boxes.get(i)[1];
             for (int g = 0; g < numGoals; g++) {
                 int d = pushDist[g][br][bc];
-                cost[i][g] = (d == Integer.MAX_VALUE) ? INF4 : d;
+                cost[i][g] = (d == Integer.MAX_VALUE) ? INF4 : d; //Cap unreachable goals so they're still assignable but never preferred
             }
         }
 
@@ -757,65 +647,79 @@ public class SokoBot {
     }
 
     /**
-     * Solves the minimum-cost perfect bipartite matching problem using the classic O(n^3)
-     * Hungarian algorithm (Jonker-Volgenant / Kuhn-Munkres potentials version).
-     * <p>
-     * Supports a rectangular cost matrix ({@code n} boxes &lt;= {@code m} goals) by internally
-     * padding to a square matrix with free dummy assignments.
+     * Solves the minimum-cost assignment problem using the Hungarian algorithm.
+     * Finds the cheapest way to match n boxes to m goals, where each box gets
+     * a distinct goal. Pads the cost matrix to square internally if n and m differ.
      *
-     * @param cost {@code n x m} matrix where {@code cost[i][j]} is the push cost of assigning
-     *             box {@code i} to goal {@code j}
-     * @param n    number of boxes (rows used in {@code cost})
-     * @param m    number of goals (columns used in {@code cost})
-     * @return the minimum total cost of a perfect matching of all {@code n} boxes to distinct goals
+     * @param cost n x m matrix where cost[i][j] is the push cost of sending box i to goal j
+     * @param n    number of boxes
+     * @param m    number of goals
+     * @return the minimum total cost of a complete box-to-goal matching
      */
     private int hungarianMinCost(int[][] cost, int n, int m) {
-        // pad to a square matrix so the standard algorithm applies cleanly
+        //Time spent trying to implement this algorithm: 17 hours
+        //For anyone reading this, I documented this whole thing as in-depth as my
+        //brain can handle so it is clear what type of dark magic I performed to make it work. - Schuyler
         int size = Math.max(n, m);
         final int INF = Integer.MAX_VALUE / 4;
+
+        //1-indexed copy of the cost matrix, padded to square with free dummy assignments
         int[][] a = new int[size + 1][size + 1];
         for (int i = 1; i <= size; i++) {
             for (int j = 1; j <= size; j++) {
-                if (i <= n && j <= m) {
-                    a[i][j] = cost[i - 1][j - 1];
-                } else {
-                    a[i][j] = 0; // padding rows/cols are free dummy assignments
-                }
+                a[i][j] = (i <= n && j <= m) ? cost[i - 1][j - 1] : 0;
             }
         }
 
+        //Dual variables for rows (u) and columns (v): the algorithm keeps these as
+        //"potentials" and adjusts them so that the reduced cost a[i][j]-u[i]-v[j]
+        //is always >= 0. When it hits exactly 0 for a matched pair, that pair is optimal.
         int[] u = new int[size + 1];
         int[] v = new int[size + 1];
-        int[] p = new int[size + 1]; // p[j] = row currently matched to column j
+
+        //p[j] = which box is currently matched to goal j (0 means unmatched)
+        int[] p = new int[size + 1];
+
+        //way[j] = which goal column we came from when we found the best reduced cost to j,
+        //used to retrace and flip the augmenting path at the end of each round
         int[] way = new int[size + 1];
 
+        //Add one box at a time, extending the matching to cover it
         for (int i = 1; i <= size; i++) {
-            p[0] = i;
+            p[0] = i; // sentinel: treat column 0 as a fake "entry point" holding the current box
             int j0 = 0;
+
+            //minv[j] = best reduced cost seen so far to reach unmatched goal j in this round
             int[] minv = new int[size + 1];
-            boolean[] used = new boolean[size + 1];
+            boolean[] used = new boolean[size + 1]; //goals already on the augmenting path
             Arrays.fill(minv, INF);
 
+            //Walk the augmenting path: each iteration locks in one more column and
+            //finds the next cheapest column to extend to
             do {
                 used[j0] = true;
-                int i0 = p[j0];
+                int i0 = p[j0]; //box currently sitting at column j0
                 int delta = INF;
                 int j1 = -1;
 
                 for (int j = 1; j <= size; j++) {
                     if (!used[j]) {
+                        //Reduced cost: how much this assignment costs above the current dual values
                         int cur = a[i0][j] - u[i0] - v[j];
                         if (cur < minv[j]) {
                             minv[j] = cur;
-                            way[j] = j0;
+                            way[j] = j0; //remember we reached j from j0
                         }
                         if (minv[j] < delta) {
                             delta = minv[j];
-                            j1 = j;
+                            j1 = j; //j1 is the cheapest next column to lock in
                         }
                     }
                 }
 
+                //Shift the dual variables by delta to keep reduced costs non-negative.
+                //Columns on the path get their potentials updated; others get minv reduced
+                //by the same amount so relative distances stay correct for the next iteration.
                 for (int j = 0; j <= size; j++) {
                     if (used[j]) {
                         u[p[j]] += delta;
@@ -825,9 +729,10 @@ public class SokoBot {
                     }
                 }
 
-                j0 = j1;
-            } while (p[j0] != 0);
+                j0 = j1; //advance to the column we just locked in
+            } while (p[j0] != 0); //stop once we reach an unmatched column
 
+            //Flip the augmenting path to include the new box in the matching
             do {
                 int j1 = way[j0];
                 p[j0] = p[j1];
@@ -835,6 +740,7 @@ public class SokoBot {
             } while (j0 != 0);
         }
 
+        //Sum up the costs for real box-to-goal pairs only, ignoring dummy padding assignments
         int total = 0;
         for (int j = 1; j <= size; j++) {
             if (p[j] != 0 && p[j] <= n && j <= m) {
@@ -845,58 +751,51 @@ public class SokoBot {
     }
 
     /**
-     * Determines whether the given box configuration is a deadlock — a dead end the search
-     * should prune.
-     * <p>
-     * A state is considered deadlocked if either:
-     * <ol>
-     *   <li>some box that is not already on a goal is permanently frozen
-     *       (see {@link #isFrozen(int, int, boolean[][], boolean[][])}), or</li>
-     *   <li>no perfect matching of boxes to goals exists anymore (assignment infeasible,
-     *       see {@link #hasGoalAssignment(List)}), which can happen even with no single frozen
-     *       box — e.g. two boxes mutually boxed into a region that only has one reachable
-     *       goal between them.</li>
-     * </ol>
+     * Returns true if the current box layout can never lead to a solution.
+     *
+     * Two things are checked: whether any box that isn't on a goal is permanently stuck
+     * and can never be pushed again, and whether there's still a way to match every box
+     * to a distinct reachable goal. If either check fails, the state is a dead end.
      *
      * @param boxes current box positions, each entry as {row, col}
-     * @return {@code true} if this configuration can never lead to a solved state
+     * @return true if this layout can never be solved
      */
     private boolean isDeadlocked(List<int[]> boxes) {
+        //Grid form of box positions so isFrozen can do O(1) occupancy checks
         boolean[][] boxGrid = new boolean[height][width];
         for (int[] box : boxes) {
             boxGrid[box[0]][box[1]] = true;
         }
 
+        //Tracks which boxes have already been confirmed stuck, so that when
+        //isFrozen checks a neighbor it knows whether that neighbor can still move
         boolean[][] frozen = new boolean[height][width];
 
         for (int[] box : boxes) {
             int r = box[0];
             int c = box[1];
             if (isFrozen(r, c, boxGrid, frozen)) {
-                frozen[r][c] = true;
+                frozen[r][c] = true; //Mark so neighboring boxes can factor this in
                 if (!goals[r][c]) {
-                    return true; // frozen off-goal box -> puzzle can never be solved from here
+                    return true; //Stuck off a goal, in other words no way to fix this
                 }
             }
         }
 
+        //Even if no box is individually frozen, the layout can still be unsolvable
+        //if there's no way to assign every box to a distinct reachable goal
         return !hasGoalAssignment(boxes);
     }
 
     /**
-     * Checks whether the box at {@code (r, c)} is frozen — permanently immobile.
-     * <p>
-     * A box is frozen if it cannot be pushed in either direction along the horizontal axis
-     * AND cannot be pushed in either direction along the vertical axis (see
-     * {@link #isBlockedOnAxis(int, int, int, boolean[][], boolean[][])}). A box frozen on
-     * both axes can never move again, so unless it's sitting on a goal already, the state is dead.
+     * Returns true if the box at (r, c) is permanently stuck and can never be pushed again.
+     * A box is stuck if it's blocked on both the horizontal and vertical axes.
      *
-     * @param r       row of the box being checked
-     * @param c       column of the box being checked
-     * @param boxGrid {@code height x width} grid marking which cells currently hold a box
-     * @param frozen  {@code height x width} grid marking which boxes have already been
-     *                confirmed frozen earlier in the current deadlock-detection pass
-     * @return {@code true} if the box can never be pushed again
+     * @param r       row of the box
+     * @param c       column of the box
+     * @param boxGrid grid marking which cells have a box
+     * @param frozen  grid marking which boxes are already confirmed stuck
+     * @return true if the box can never move again
      */
     private boolean isFrozen(int r, int c, boolean[][] boxGrid, boolean[][] frozen) {
         boolean blockedHorizontal = isBlockedOnAxis(r, c, 0, boxGrid, frozen);
@@ -905,21 +804,18 @@ public class SokoBot {
     }
 
     /**
-     * Checks whether the box at {@code (r, c)} is blocked along a given axis — i.e. whether
-     * BOTH push directions along that axis are individually impossible.
-     * <p>
-     * Pushing toward side A requires: side A is a legal box destination (not a
-     * wall/box/off-grid/dead-square), AND side B (the opposite side, where the player must
-     * stand to perform the push) is merely walkable (not a wall/box/off-grid — dead-square
-     * status doesn't matter for a player standing spot, only for where a box can land).
+     * Returns true if the box at (r, c) cannot be pushed in either direction along the given axis.
+     * axis 0 is horizontal (left/right), axis 1 is vertical (up/down).
      *
-     * @param r       row of the box being checked
-     * @param c       column of the box being checked
-     * @param axis    {@code 0} for horizontal (left/right), {@code 1} for vertical (up/down)
-     * @param boxGrid {@code height x width} grid marking which cells currently hold a box
-     * @param frozen  {@code height x width} grid marking which boxes have already been
-     *                confirmed frozen earlier in the current deadlock-detection pass
-     * @return {@code true} if the box cannot be pushed in either direction along this axis
+     * A push in one direction needs two things: the cell the box would land on must be a valid
+     * destination, and the cell the player would stand on to push must be walkable.
+     *
+     * @param r       row of the box
+     * @param c       column of the box
+     * @param axis    0 for horizontal, 1 for vertical
+     * @param boxGrid grid marking which cells have a box
+     * @param frozen  grid marking which boxes are already confirmed stuck
+     * @return true if the box cannot be pushed either way along this axis
      */
     private boolean isBlockedOnAxis(int r, int c, int axis, boolean[][] boxGrid, boolean[][] frozen) {
         int dRow1 = (axis == 1) ? -1 : 0;
@@ -927,11 +823,11 @@ public class SokoBot {
         int dRow2 = -dRow1;
         int dCol2 = -dCol1;
 
-        // push toward side 1 needs: side 1 is a valid box destination, side 2 is walkable for the player
+        //Push toward side 1: side 1 must be a valid landing spot, side 2 must be walkable
         boolean canPushToSide1 = !isBlockedSide(r, c, dRow1, dCol1, boxGrid, frozen, true)
                 && !isBlockedSide(r, c, dRow2, dCol2, boxGrid, frozen, false);
 
-        // push toward side 2 needs: side 2 is a valid box destination, side 1 is walkable for the player
+        //Push toward side 2: side 2 must be a valid landing spot, side 1 must be walkable
         boolean canPushToSide2 = !isBlockedSide(r, c, dRow2, dCol2, boxGrid, frozen, true)
                 && !isBlockedSide(r, c, dRow1, dCol1, boxGrid, frozen, false);
 
@@ -939,75 +835,58 @@ public class SokoBot {
     }
 
     /**
-     * Checks whether the neighboring cell at {@code (r+dRow, c+dCol)} blocks the box at
-     * {@code (r, c)} on this side.
-     * <p>
-     * The neighboring cell plays one of two different roles depending on which push direction
-     * is being tested, so the check differs accordingly:
-     * <ul>
-     *   <li>{@code asDestination == true}: can the box ever come to rest here? Blocked if it's
-     *       off-grid, a wall, a dead square (landing there is an unrecoverable mistake), or
-     *       another box that is itself already confirmed frozen.</li>
-     *   <li>{@code asDestination == false}: can the player merely stand here to perform the
-     *       push? Blocked if it's off-grid, a wall, or another box that is itself already
-     *       confirmed frozen. Dead-square status is irrelevant here, since the player is never
-     *       restricted from walking onto a dead square, only a box is.</li>
-     * </ul>
-     * In both roles, a neighboring box only blocks if that box is itself confirmed frozen
-     * (mutual/chain freeze — recursion is safe since {@code frozen} only contains boxes
-     * confirmed frozen earlier in this pass, so there's no cycle: a box can't be marked frozen
-     * based on itself). A movable neighboring box does NOT permanently block either role, since
-     * it could in principle be pushed out of the way first — whether it's sitting where this
-     * box needs to land, or where the player needs to stand to push it.
+     * Checks whether the neighboring cell at (r+dRow, c+dCol) blocks a push on this side.
+     *
+     * The cell plays one of two roles: if asDestination is true, it's where the box would land
+     * (blocked by walls, dead squares, or stuck boxes); if false, it's where the player must
+     * stand to push (blocked by walls or stuck boxes, but not dead squares since those only
+     * restrict boxes, not the player).
+     *
+     * A neighboring box only blocks if it is itself confirmed stuck. A box that can still move
+     * doesn't count as permanently blocking since it could be pushed out of the way first.
      *
      * @param r             row of the box being checked
      * @param c             column of the box being checked
-     * @param dRow          row offset of the side being checked ({@code -1}, {@code 0}, or {@code 1})
-     * @param dCol          column offset of the side being checked ({@code -1}, {@code 0}, or {@code 1})
-     * @param boxGrid       {@code height x width} grid marking which cells currently hold a box
-     * @param frozen        {@code height x width} grid marking which boxes have already been
-     *                      confirmed frozen earlier in the current deadlock-detection pass
-     * @param asDestination {@code true} to check this side as a push destination for the box,
-     *                      {@code false} to check it as a standing spot for the player
-     * @return {@code true} if this side blocks the corresponding push
+     * @param dRow          row offset of the neighboring cell
+     * @param dCol          column offset of the neighboring cell
+     * @param boxGrid       grid marking which cells have a box
+     * @param frozen        grid marking which boxes are already confirmed stuck
+     * @param asDestination true if checking where the box would land, false if checking where the player stands
+     * @return true if this side blocks the push
      */
     private boolean isBlockedSide(int r, int c, int dRow, int dCol, boolean[][] boxGrid, boolean[][] frozen, boolean asDestination) {
         int sideR = r + dRow;
         int sideC = c + dCol;
 
         if (sideR < 0 || sideR >= height || sideC < 0 || sideC >= width) {
-            return true; // off-grid, neither a box nor the player can occupy this side
+            return true; //Off the grid
         }
         if (walls[sideR][sideC]) {
             return true;
         }
         if (asDestination && deadSquares[sideR][sideC]) {
-            return true; // only relevant when checking whether a box could land here
+            return true; //Box can't land on a dead square
         }
         if (boxGrid[sideR][sideC]) {
-            return frozen[sideR][sideC];
+            return frozen[sideR][sideC]; //Only blocks if that box is also stuck
         }
         return false;
     }
 
     /**
-     * Hall's-theorem style feasibility check for box-to-goal assignment.
-     * <p>
-     * Determines whether a perfect matching exists that assigns every box to a distinct goal
-     * it can actually reach (ignoring other boxes, since they can in principle be pushed out
-     * of the way). Uses the precomputed {@code pushDist} table for O(1) reachability checks
-     * instead of per-call BFS.
+     * Returns true if every box can still be matched to a distinct goal it can reach.
+     * If no such matching exists, the puzzle is unsolvable from this state regardless
+     * of how the boxes are moved around.
      *
      * @param boxes current box positions, each entry as {row, col}
-     * @return {@code true} if every box can be matched to a distinct reachable goal
+     * @return true if a valid box-to-goal assignment still exists
      */
     private boolean hasGoalAssignment(List<int[]> boxes) {
         int n = boxes.size();
-        if (n == 0)         return true;
-        if (numGoals < n)   return false;
+        if (n == 0)       return true;
+        if (numGoals < n) return false;
 
-        // Build adjacency using the precomputed table: box i reaches goal g iff
-        // pushDist[g][br][bc] < MAX_VALUE (there exists a geometric push path to it).
+        //Build the list of goals each box can reach
         List<List<Integer>> adjacency = new ArrayList<>();
         for (int[] box : boxes) {
             int br = box[0], bc = box[1];
@@ -1018,7 +897,7 @@ public class SokoBot {
             adjacency.add(reachableGoals);
         }
 
-        // Kuhn's algorithm: standard augmenting-path bipartite matching
+        //Try to match every box to a distinct goal using augmenting paths
         int[] matchGoalToBox = new int[numGoals];
         Arrays.fill(matchGoalToBox, -1);
 
@@ -1034,19 +913,15 @@ public class SokoBot {
     }
 
     /**
-     * Attempts to find an augmenting path starting at the given box, as part of Kuhn's
-     * bipartite matching algorithm.
-     * <p>
-     * Tries each goal the box can reach; if that goal is already taken, recursively attempts
-     * to bump the box currently holding it to a different goal.
+     * Tries to find a goal for the given box as part of the matching in hasGoalAssignment.
+     * If the best candidate goal is already taken by another box, it tries to move that box
+     * to a different goal recursively.
      *
-     * @param boxIndex      index of the box (into {@code adjacency}) to find a match for
-     * @param adjacency     for each box index, the list of goal indices it can reach
-     * @param visited       goals already visited in the current augmenting-path search,
-     *                      to avoid revisiting
-     * @param matchGoalToBox current matching: {@code matchGoalToBox[j]} is the box index
-     *                      matched to goal {@code j}, or {@code -1} if unmatched
-     * @return {@code true} if an augmenting path was found and the matching was updated
+     * @param boxIndex       index of the box to match
+     * @param adjacency      list of reachable goals for each box
+     * @param visited        goals already tried in this round
+     * @param matchGoalToBox current matching state
+     * @return true if a valid match was found
      */
     private boolean tryAugment(int boxIndex, List<List<Integer>> adjacency, boolean[] visited, int[] matchGoalToBox) {
         for (int goalIndex : adjacency.get(boxIndex)) {
@@ -1064,10 +939,10 @@ public class SokoBot {
     }
 
     /**
-     * Terminal check for the search: is every box currently resting on a goal tile?
+     * Returns true if every box is currently sitting on a goal tile.
      *
      * @param boxes current box positions, each entry as {row, col}
-     * @return {@code true} if the puzzle is solved
+     * @return true if the puzzle is solved
      */
     private boolean isSolved(List<int[]> boxes) {
         for (int[] box : boxes) {
@@ -1096,26 +971,21 @@ public class SokoBot {
 
     /**
      * One node in the A* search tree.
-     * <p>
-     * {@code state} carries the box layout plus the player's <em>canonical</em> reachable-region
-     * cell, used purely for hashing/deduplication (see {@link State}). {@code trueR}/{@code trueC}
-     * carry the player's actual physical position at this node -- i.e. the cell the previously
-     * pushed box used to occupy, or the puzzle's literal starting cell for the root node.
-     * <p>
+     *
+     * state carries the box layout plus the player's canonical reachable-region cell, used
+     * purely for hashing and deduplication. trueR and trueC carry the player's actual physical
+     * position at this node, which is the cell the previously pushed box used to occupy, or the
+     * puzzle's literal starting cell for the root node.
+     *
      * Keeping these separate matters: two states with the same boxes and the same reachable
      * region are the same search state regardless of exactly where in that region the player
-     * is standing (they can walk anywhere in it for free), so canonicalization is correct and
-     * necessary to keep the state space from exploding. But the canonical cell is just an
-     * arbitrary representative of the region (the top-left-most free cell) -- it is generally
-     * NOT where the player is actually standing. Reconstructing a real, physically walkable
-     * move string requires walking from the actual previous position, so {@link #expand} must
-     * use {@code trueR}/{@code trueC} (never the canonical cell) as the BFS source when it
-     * calls {@link #pathTo(List, int, int, int, int)}.
-     * <p>
-     * {@code g} and {@code totalMoves} together form the lexicographic search cost: {@code g}
-     * (pushes) is the primary criterion the heuristic actually bounds, while {@code totalMoves}
-     * (every real keypress, walking included) is a secondary tie-break so that among multiple
-     * push-count-tied routes to the same goal, the one needing less walking is preferred.
+     * is standing. But the canonical cell is just the top-left-most free cell, not necessarily
+     * where the player actually is. Reconstructing a walkable move string requires starting from
+     * the true position, not the canonical one.
+     *
+     * g and totalMoves together form the lexicographic search cost: g (pushes) is the primary
+     * criterion the heuristic bounds, while totalMoves (every keypress, walking included) is a
+     * secondary tie-break so that among push-count-tied routes, the one needing less walking wins.
      */
     private static class Node {
         final State state;
@@ -1140,12 +1010,11 @@ public class SokoBot {
     }
 
     /**
-     * Unpacks a {@link State}'s sorted {@code int[][]} box array back into a {@code List<int[]>},
-     * the shape every Part 1-3 helper ({@link #heuristic}, {@link #isDeadlocked}, {@link #occupied},
-     * etc.) expects.
+     * Unpacks a State's sorted box array back into a List of int arrays,
+     * the shape every Part 1-3 helper expects.
      *
      * @param state the state to unpack
-     * @return the same box positions as a list, in whatever order {@link State} sorted them in
+     * @return the same box positions as a list
      */
     private List<int[]> stateToBoxList(State state) {
         List<int[]> list = new ArrayList<>(state.boxes.length);
@@ -1156,33 +1025,19 @@ public class SokoBot {
     }
 
     /**
-     * State expansion: generates every legal successor of {@code current} by trying to push
-     * each box one step in each of the four directions, and enqueues the survivors onto the
-     * open list.
-     * <p>
-     * A push of box {@code (br, bc)} in direction {@code (dRow, dCol)} requires:
-     * <ol>
-     *   <li>the player can actually reach the cell behind the box, {@code (br - dRow, bc - dCol)},
-     *       without pushing anything else first -- checked against the box's current reachable
-     *       region ({@link #findReachable});</li>
-     *   <li>the destination cell, {@code (br + dRow, bc + dCol)}, is in bounds, not a wall, not
-     *       a known dead square, and not already occupied by another box;</li>
-     *   <li>the resulting box configuration is not an immediate deadlock -- checked last since
-     *       it's the most expensive test ({@link #isDeadlocked}).</li>
-     * </ol>
-     * Successors that pass all three are only enqueued if they reach their resulting state at a
-     * strictly better (pushes, totalMoves) lexicographic cost than any previously recorded route
-     * to that same state (or are reaching it for the first time) -- this is the standard "lazy
-     * deletion" pattern for using a {@link PriorityQueue} (which has no decrease-key) as an A*
-     * open list, extended to a lexicographic cost so that among multiple routes tied on push
-     * count, the one needing less walking wins.
+     * Generates every legal successor of the current node by trying to push each box one step
+     * in each of the four directions, and enqueues the survivors onto the open list.
      *
-     * @param current   the node being expanded
-     * @param boxes     {@code current}'s box positions, already unpacked via {@link #stateToBoxList}
-     * @param open      the A* open list
-     * @param bestCost  best known (pushes, totalMoves) lexicographic cost seen so far for each
-     *                  visited state, packed via {@link #packCost}
-     * @param closed    states that have already been popped and fully expanded
+     * A push requires: the player can reach the cell behind the box without pushing anything
+     * else first; the destination cell is in bounds, not a wall, not a dead square, and not
+     * occupied by another box; and the resulting configuration is not a deadlock. Successors
+     * that pass all three are only enqueued if they improve on the best known cost to that state.
+     *
+     * @param current  the node being expanded
+     * @param boxes    the current box positions, already unpacked
+     * @param open     the A* open list
+     * @param bestCost best known cost seen so far for each visited state
+     * @param closed   states that have already been fully expanded
      */
     private void expand(Node current, List<int[]> boxes, PriorityQueue<Node> open,
                         HashMap<State, Long> bestCost, HashSet<State> closed) {
@@ -1243,7 +1098,7 @@ public class SokoBot {
                 if (isDeadlocked(newBoxes)) continue;
 
                 // BFS 2: reachable region from the box's old position in the NEW box layout,
-                // to find the canonical cell. No pathTo() call needed — we already have the
+                // to find the canonical cell. No pathTo() call needed, we already have the
                 // walk parent map from BFS 1 above.
                 boolean[][] newReachable = new boolean[height][width];
                 int[] newCanonical = {br, bc};
@@ -1273,7 +1128,7 @@ public class SokoBot {
                 State newState = new State(newBoxes, newCanonical[0], newCanonical[1]);
                 if (closed.contains(newState)) continue;
 
-                // Reconstruct walk path using the parent map from BFS 1 — O(path length) only,
+                // Reconstruct walk path using the parent map from BFS 1, O(path length) only,
                 // no additional BFS.
                 StringBuilder walkSB = new StringBuilder();
                 int cr = standR, cc = standC;
@@ -1299,12 +1154,11 @@ public class SokoBot {
     }
 
     /**
-     * Solution reconstruction: walks the parent chain from the goal node back to the root,
-     * collecting each edge's move string, then re-emits them in forward (root-to-goal) order.
+     * Walks the parent chain from the goal node back to the root, collecting each edge's move
+     * string, then re-emits them in forward order.
      *
-     * @param goalNode the node whose box configuration satisfies {@link #isSolved}
-     * @return the full move string -- every {@code u}/{@code d}/{@code l}/{@code r} from the
-     *         puzzle's start to the solved configuration, in order
+     * @param goalNode the node whose box configuration is solved
+     * @return the full u/d/l/r move string from start to solution
      */
     private String buildPath(Node goalNode) {
         ArrayDeque<String> segments = new ArrayDeque<>();
@@ -1322,9 +1176,8 @@ public class SokoBot {
     }
 
     /**
-     * Packs a (pushes, totalMoves) pair into a single {@code long} so two lexicographic costs
-     * can be compared with one numeric comparison. Safe as long as {@code totalMoves} stays
-     * under 1,000,000, which the time/node budget in {@link #solveSokobanPuzzle} guarantees.
+     * Packs a (pushes, totalMoves) pair into a single long so two lexicographic costs
+     * can be compared with one numeric comparison.
      *
      * @param pushes     number of pushes in this cost
      * @param totalMoves number of real keypresses (pushes + walking) in this cost
